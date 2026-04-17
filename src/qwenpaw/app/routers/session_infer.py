@@ -20,7 +20,7 @@ from ..agent_context import get_agent_for_request
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "qwenpaw-session-infer-v1"
+PROMPT_VERSION = "qwenpaw-session-infer-v2"
 
 router = APIRouter(prefix="/qwenpaw", tags=["qwenpaw"])
 
@@ -44,6 +44,8 @@ class SessionInferRequest(BaseModel):
     question: str = Field(..., min_length=1)
     traceId: str = Field(default="")
     intents: list[SessionInferIntent] = Field(default_factory=list)
+    routingPolicy: dict[str, Any] = Field(default_factory=dict)
+    outputSchema: dict[str, Any] = Field(default_factory=dict)
     sessionId: Optional[str] = None
     conversationId: Optional[str] = None
     chatId: Optional[str] = None
@@ -55,6 +57,8 @@ class CandidatePlan(BaseModel):
     executionMode: str
     confidence: float
     slots: dict[str, Any] = Field(default_factory=dict)
+    needClarify: bool = False
+    clarifyQuestion: Optional[str] = None
     roleCode: Optional[str] = None
     sqlTemplateCode: Optional[str] = None
     selectedTableId: Optional[int] = None
@@ -156,24 +160,39 @@ def _build_messages(payload: SessionInferRequest) -> list[dict[str, Any]]:
         ensure_ascii=False,
         indent=2,
     )
+    routing_policy_json = json.dumps(
+        payload.routingPolicy or {},
+        ensure_ascii=False,
+        indent=2,
+    )
+    output_schema_json = json.dumps(
+        payload.outputSchema or {},
+        ensure_ascii=False,
+        indent=2,
+    )
     system_prompt = (
-        "You are a query planner.\n"
-        "Pick exactly one intent from the provided intents.\n"
-        "Return JSON only, no markdown fences, no explanation.\n"
-        "JSON schema:\n"
-        "{\n"
-        '  "intentCode": "string, must be one of intents.intentCode",\n'
-        '  "executionMode": "string",\n'
-        '  "confidence": "number between 0 and 1",\n'
-        '  "slots": {"any":"json object"},\n'
-        '  "roleCode": "string|null",\n'
-        '  "sqlTemplateCode": "string|null",\n'
-        '  "selectedTableId": "number|null"\n'
-        "}"
+        "你是受控查询规划链路中的意图路由器。\n"
+        "请从给定 intents 中只选择一个意图，并抽取可用 slots。\n"
+        "仅返回 JSON，不要 markdown，不要解释说明。\n"
+        "证据优先级：\n"
+        "1) intentName/domain/triggerPhrases\n"
+        "2) mustConditions/forbiddenConditions/disambiguation\n"
+        "3) slotSchema + slotKeys\n"
+        "4) description（仅辅助）\n"
+        "硬约束：\n"
+        "- intentCode 必须来自 intents.intentCode。\n"
+        "- executionMode 必须与选中 intent 一致。\n"
+        "- roleCode/sqlTemplateCode/selectedTableId 必须来自选中 intent。\n"
+        "- 禁止编造选中 intent 之外的值。\n"
+        "- 若信息不足，设置 needClarify=true，并给出最小澄清问题 clarifyQuestion。\n"
+        "- confidence 必须是 [0, 1] 区间数值。\n"
+        "当提供 outputSchema 时，必须严格按其结构输出。"
     )
     user_prompt = (
         f"traceId: {payload.traceId}\n"
         f"question: {payload.question}\n"
+        f"routingPolicy: {routing_policy_json}\n"
+        f"outputSchema: {output_schema_json}\n"
         f"intents: {intents_json}"
     )
     return [
@@ -234,9 +253,17 @@ def _build_candidate_plan(
         )
 
     matched = intent_map[intent_code]
-    execution_mode = str(
-        candidate_raw.get("executionMode") or matched.executionMode or "",
-    ).strip()
+    matched_execution_mode = str(matched.executionMode or "").strip()
+    model_execution_mode = str(candidate_raw.get("executionMode") or "").strip()
+    if (
+        matched_execution_mode
+        and model_execution_mode
+        and matched_execution_mode != model_execution_mode
+    ):
+        raise ValueError(
+            "executionMode in model output does not match provided intent",
+        )
+    execution_mode = matched_execution_mode or model_execution_mode
     if not execution_mode:
         raise ValueError("Missing executionMode in model output")
 
@@ -251,18 +278,58 @@ def _build_candidate_plan(
     if not isinstance(slots, dict):
         slots = {}
 
+    role_code = candidate_raw.get("roleCode")
+    if matched.roleCode and role_code and str(role_code).strip() != str(matched.roleCode).strip():
+        raise ValueError("roleCode in model output does not match provided intent")
+    resolved_role_code = matched.roleCode or role_code
+
+    sql_template_code = candidate_raw.get("sqlTemplateCode")
+    if (
+        matched.sqlTemplateCode
+        and sql_template_code
+        and str(sql_template_code).strip() != str(matched.sqlTemplateCode).strip()
+    ):
+        raise ValueError("sqlTemplateCode in model output does not match provided intent")
+    resolved_sql_template_code = matched.sqlTemplateCode or sql_template_code
+
+    selected_table_id = candidate_raw.get("selectedTableId")
+    if (
+        matched.selectedTableId is not None
+        and selected_table_id is not None
+        and int(selected_table_id) != int(matched.selectedTableId)
+    ):
+        raise ValueError("selectedTableId in model output does not match provided intent")
+    resolved_selected_table_id = matched.selectedTableId
+    if resolved_selected_table_id is None and selected_table_id is not None:
+        try:
+            resolved_selected_table_id = int(selected_table_id)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid selectedTableId in model output")
+
+    raw_need_clarify = candidate_raw.get("needClarify", False)
+    need_clarify = raw_need_clarify
+    if isinstance(raw_need_clarify, str):
+        need_clarify = raw_need_clarify.strip().lower() in {"true", "1", "yes", "y"}
+    if not isinstance(need_clarify, bool):
+        need_clarify = bool(need_clarify)
+
+    clarify_question_raw = candidate_raw.get("clarifyQuestion")
+    clarify_question = (
+        str(clarify_question_raw).strip() if clarify_question_raw is not None else None
+    )
+    if not need_clarify:
+        clarify_question = None
+
     return CandidatePlan(
         intentCode=intent_code,
         executionMode=execution_mode,
         confidence=confidence,
         slots=slots,
-        roleCode=(candidate_raw.get("roleCode") or matched.roleCode),
-        sqlTemplateCode=(
-            candidate_raw.get("sqlTemplateCode") or matched.sqlTemplateCode
-        ),
-        selectedTableId=(
-            candidate_raw.get("selectedTableId") or matched.selectedTableId
-        ),
+        needClarify=need_clarify,
+        clarifyQuestion=clarify_question,
+        roleCode=resolved_role_code,
+        sqlTemplateCode=resolved_sql_template_code,
+        selectedTableId=resolved_selected_table_id,
     )
 
 
