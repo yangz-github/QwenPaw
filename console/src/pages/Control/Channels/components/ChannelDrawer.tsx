@@ -503,6 +503,13 @@ export function ChannelDrawer({
             >
               <Input.Password />
             </Form.Item>
+            <Form.Item
+              name="ack_message"
+              label={t("channels.ackMessage")}
+              tooltip={t("channels.ackMessageTooltip")}
+            >
+              <Input placeholder={t("channels.ackMessagePlaceholder")} />
+            </Form.Item>
           </>
         );
 
@@ -845,6 +852,12 @@ export function ChannelDrawer({
                 type="info"
                 showIcon
                 message={t("channels.weixinSetupGuide")}
+                style={{ marginBottom: 16 }}
+              />
+              <Alert
+                type="warning"
+                showIcon
+                message={t("channels.weixinContextTokenLimit")}
                 style={{ marginBottom: 16 }}
               />
             </ConfigProvider>
