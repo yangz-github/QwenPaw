@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -82,6 +83,29 @@ class SessionInferResponse(BaseModel):
     data: Optional[SessionInferData] = None
 
 
+class SessionInferStructuredCandidate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    intentCode: str = ""
+    executionMode: str = ""
+    confidence: float = 0.0
+    slots: dict[str, Any] = Field(default_factory=dict)
+    needClarify: bool = False
+    clarifyQuestion: Optional[str] = None
+    roleCode: Optional[str] = None
+    sqlTemplateCode: Optional[str] = None
+    selectedTableId: Optional[int] = None
+
+
+class SessionInferStructuredOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    candidatePlan: SessionInferStructuredCandidate = Field(
+        default_factory=SessionInferStructuredCandidate,
+    )
+    modelMeta: dict[str, Any] = Field(default_factory=dict)
+
+
 def _extract_text_from_chunk(chunk: Any) -> str:
     content = getattr(chunk, "content", None)
     if isinstance(content, str):
@@ -131,6 +155,43 @@ async def _collect_model_text(response: Any) -> str:
                 accumulated += text
         return accumulated
     return _extract_text_from_response(response)
+
+
+def _normalize_structured_metadata(raw: Any) -> Optional[dict[str, Any]]:
+    if isinstance(raw, dict):
+        return raw
+    model_dump = getattr(raw, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
+async def _collect_model_output(
+    response: Any,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    if hasattr(response, "__aiter__"):
+        accumulated = ""
+        metadata: Optional[dict[str, Any]] = None
+        async for chunk in response:  # type: ignore[union-attr]
+            text = _extract_text_from_chunk(chunk)
+            if text:
+                # Some providers emit cumulative text on each chunk.
+                if len(text) >= len(accumulated) and text.startswith(accumulated):
+                    accumulated = text
+                else:
+                    accumulated += text
+            chunk_metadata = _normalize_structured_metadata(
+                getattr(chunk, "metadata", None),
+            )
+            if chunk_metadata:
+                metadata = chunk_metadata
+        return accumulated, metadata
+
+    response_text = _extract_text_from_response(response)
+    metadata = _normalize_structured_metadata(getattr(response, "metadata", None))
+    return response_text, metadata
 
 
 def _extract_first_json_object(raw_text: str) -> dict[str, Any]:
@@ -357,12 +418,16 @@ async def post_session_infer(
     request: Request,
     x_agent_id: Optional[str] = Header(default=None, alias="X-Agent-Id"),
 ) -> SessionInferResponse:
+    stage_start = time.monotonic()
+    trace_id = (payload.traceId or "").strip()
     try:
+        resolve_start = time.monotonic()
         target_agent_id = await _resolve_target_agent_id(
             request=request,
             payload=payload,
             header_agent_id=x_agent_id,
         )
+        resolve_ms = int((time.monotonic() - resolve_start) * 1000)
         set_current_agent_id(target_agent_id)
         if payload.sessionId:
             set_current_session_id(payload.sessionId.strip())
@@ -370,15 +435,63 @@ async def post_session_infer(
         if not payload.intents:
             return SessionInferResponse(code=1, message="No intents provided")
 
+        model_create_start = time.monotonic()
         model, _ = create_model_and_formatter(agent_id=target_agent_id)
-        response = await model(_build_messages(payload))
-        response_text = await _collect_model_text(response)
-        response_json = _extract_first_json_object(response_text)
+        model_create_ms = int((time.monotonic() - model_create_start) * 1000)
 
+        build_prompt_start = time.monotonic()
+        messages = _build_messages(payload)
+        build_prompt_ms = int((time.monotonic() - build_prompt_start) * 1000)
+
+        model_call_start = time.monotonic()
+        structured_enabled = True
+        try:
+            response = await model(
+                messages,
+                structured_model=SessionInferStructuredOutput,
+            )
+        except Exception:
+            structured_enabled = False
+            logger.warning(
+                "session infer structured model call failed, fallback to plain call",
+                exc_info=True,
+            )
+            response = await model(messages)
+        model_call_ms = int((time.monotonic() - model_call_start) * 1000)
+
+        collect_start = time.monotonic()
+        response_text, response_metadata = await _collect_model_output(response)
+        collect_ms = int((time.monotonic() - collect_start) * 1000)
+
+        parse_start = time.monotonic()
+        if response_metadata is not None:
+            response_json = response_metadata
+        else:
+            response_json = _extract_first_json_object(response_text)
+        parse_ms = int((time.monotonic() - parse_start) * 1000)
+
+        candidate_start = time.monotonic()
         candidate = _build_candidate_plan(response_json, payload.intents)
+        candidate_ms = int((time.monotonic() - candidate_start) * 1000)
         model_meta = _resolve_effective_model_meta(
             target_agent_id,
             payload.traceId,
+        )
+        total_ms = int((time.monotonic() - stage_start) * 1000)
+        logger.info(
+            "session infer timing trace_id=%s intents=%d resolve_agent_ms=%d model_create_ms=%d build_prompt_ms=%d model_call_ms=%d collect_ms=%d parse_ms=%d candidate_ms=%d total_ms=%d structured_enabled=%s metadata_hit=%s",
+            trace_id,
+            len(payload.intents),
+            resolve_ms,
+            model_create_ms,
+            build_prompt_ms,
+            model_call_ms,
+            collect_ms,
+            parse_ms,
+            candidate_ms,
+            total_ms,
+            structured_enabled,
+            response_metadata is not None,
         )
         return SessionInferResponse(
             code=0,
@@ -391,5 +504,11 @@ async def post_session_infer(
     except HTTPException as exc:
         return SessionInferResponse(code=exc.status_code, message=str(exc.detail))
     except Exception as exc:
-        logger.exception("Session infer failed")
+        total_ms = int((time.monotonic() - stage_start) * 1000)
+        logger.exception(
+            "Session infer failed, trace_id=%s intents=%d total_ms=%d",
+            trace_id,
+            len(payload.intents),
+            total_ms,
+        )
         return SessionInferResponse(code=1, message=str(exc))
