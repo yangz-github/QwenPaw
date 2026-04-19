@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from typing import Any, Optional
 from uuid import uuid4
@@ -24,8 +23,7 @@ logger = logging.getLogger(__name__)
 PROMPT_VERSION = "qwenpaw-session-infer-v2"
 SESSION_INFER_TOTAL_BUDGET_MS = 18000
 SESSION_INFER_COLLECT_BUDGET_MS = 8000
-SESSION_INFER_REPAIR_COLLECT_BUDGET_MS = 3000
-SESSION_INFER_REPAIR_START_DEADLINE_MS = 12000
+SESSION_INFER_PROMPT_MAX_DESCRIPTION_CHARS = 160
 
 router = APIRouter(prefix="/qwenpaw", tags=["qwenpaw"])
 
@@ -220,13 +218,29 @@ def _extract_candidate_from_tool_content(content: Any) -> Optional[dict[str, Any
 async def _collect_model_output(
     response: Any,
     max_duration_ms: Optional[int] = None,
-) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    stop_on_usable_metadata: bool = False,
+) -> tuple[
+    str,
+    Optional[dict[str, Any]],
+    Optional[dict[str, Any]],
+    Optional[int],
+    int,
+    Optional[int],
+    bool,
+]:
     if hasattr(response, "__aiter__"):
         accumulated = ""
         metadata: Optional[dict[str, Any]] = None
         tool_candidate: Optional[dict[str, Any]] = None
         collect_started = time.monotonic()
+        first_chunk_ms: Optional[int] = None
+        chunk_count = 0
+        valid_metadata_at_chunk_idx: Optional[int] = None
+        collect_budget_cut = False
         async for chunk in response:  # type: ignore[union-attr]
+            chunk_count += 1
+            if first_chunk_ms is None:
+                first_chunk_ms = int((time.monotonic() - collect_started) * 1000)
             if max_duration_ms is not None:
                 elapsed_ms = int((time.monotonic() - collect_started) * 1000)
                 if elapsed_ms >= max_duration_ms:
@@ -235,6 +249,7 @@ async def _collect_model_output(
                         elapsed_ms,
                         max_duration_ms,
                     )
+                    collect_budget_cut = True
                     break
             text = _extract_text_from_chunk(chunk)
             if text:
@@ -248,78 +263,76 @@ async def _collect_model_output(
             )
             if chunk_metadata:
                 metadata = chunk_metadata
+                if (
+                    stop_on_usable_metadata
+                    and _metadata_is_usable(metadata)
+                    and valid_metadata_at_chunk_idx is None
+                ):
+                    valid_metadata_at_chunk_idx = chunk_count
+                    break
             candidate = _extract_candidate_from_tool_content(
                 getattr(chunk, "content", None),
             )
             if candidate:
                 tool_candidate = candidate
-        return accumulated, metadata, tool_candidate
+        return (
+            accumulated,
+            metadata,
+            tool_candidate,
+            first_chunk_ms,
+            chunk_count,
+            valid_metadata_at_chunk_idx,
+            collect_budget_cut,
+        )
 
     response_text = _extract_text_from_response(response)
     metadata = _normalize_structured_metadata(getattr(response, "metadata", None))
     tool_candidate = _extract_candidate_from_tool_content(
         getattr(response, "content", None),
     )
-    return response_text, metadata, tool_candidate
-
-
-def _build_clarify_fallback_output(
-    payload: SessionInferRequest,
-) -> dict[str, Any]:
-    fallback_intent = _select_fallback_intent(payload.intents)
-    clarify_question = "请确认客户编号与产品后，我再为你查询。"
-    return {
-        "candidatePlan": {
-            "intentCode": str(fallback_intent.intentCode or "").strip(),
-            "executionMode": str(fallback_intent.executionMode or "").strip(),
-            "confidence": 0.0,
-            "slots": {},
-            "needClarify": True,
-            "clarifyQuestion": clarify_question,
-            "roleCode": fallback_intent.roleCode,
-            "sqlTemplateCode": fallback_intent.sqlTemplateCode,
-            "selectedTableId": fallback_intent.selectedTableId,
-        },
-        "modelMeta": {},
-    }
-
-
-def _extract_first_json_object(raw_text: str) -> dict[str, Any]:
-    text = raw_text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        parsed = json.loads(text[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-
-    raise ValueError("Model output is not a valid JSON object")
+    has_payload = bool(response_text or metadata or tool_candidate)
+    return (
+        response_text,
+        metadata,
+        tool_candidate,
+        0 if has_payload else None,
+        1 if has_payload else 0,
+        1 if (_metadata_is_usable(metadata)) else None,
+        False,
+    )
 
 
 def _build_messages(payload: SessionInferRequest) -> list[dict[str, Any]]:
+    compact_intents: list[dict[str, Any]] = []
+    for intent in payload.intents:
+        description = str(intent.description or "").strip()
+        if len(description) > SESSION_INFER_PROMPT_MAX_DESCRIPTION_CHARS:
+            description = description[:SESSION_INFER_PROMPT_MAX_DESCRIPTION_CHARS]
+        compact_intents.append(
+            {
+                "intentCode": str(intent.intentCode or "").strip(),
+                "executionMode": str(intent.executionMode or "").strip(),
+                "description": description,
+                "roleCode": intent.roleCode,
+                "sqlTemplateCode": intent.sqlTemplateCode,
+                "selectedTableId": intent.selectedTableId,
+                "slotKeys": list(intent.slotKeys or []),
+            },
+        )
     intents_json = json.dumps(
-        [intent.model_dump() for intent in payload.intents],
+        compact_intents,
         ensure_ascii=False,
-        indent=2,
+        separators=(",", ":"),
     )
     routing_policy_json = json.dumps(
         payload.routingPolicy or {},
         ensure_ascii=False,
-        indent=2,
+        separators=(",", ":"),
     )
     output_schema_json = json.dumps(
         payload.outputSchema or {},
         ensure_ascii=False,
-        indent=2,
+        separators=(",", ":"),
     )
     system_prompt = (
         "你是受控查询规划链路中的意图路由器。\n"
@@ -351,60 +364,99 @@ def _build_messages(payload: SessionInferRequest) -> list[dict[str, Any]]:
         {"role": "user", "content": user_prompt},
     ]
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
 
-def _build_candidate_brief(intents: list[SessionInferIntent]) -> list[dict[str, Any]]:
-    return [
-        {
-            "intentCode": str(intent.intentCode or "").strip(),
-            "executionMode": str(intent.executionMode or "").strip(),
-            "roleCode": intent.roleCode,
-            "sqlTemplateCode": intent.sqlTemplateCode,
-            "selectedTableId": intent.selectedTableId,
-        }
+
+def _to_confidence(value: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_candidate_plan_local_repair(
+    output_raw: Any,
+    intents: list[SessionInferIntent],
+) -> tuple[CandidatePlan, str]:
+    if not intents:
+        raise ValueError("No intents provided")
+
+    candidate_raw: dict[str, Any] = {}
+    if isinstance(output_raw, dict):
+        nested = output_raw.get("candidatePlan")
+        if isinstance(nested, dict):
+            candidate_raw = nested
+        else:
+            candidate_raw = output_raw
+
+    preferred_intent_code = str(candidate_raw.get("intentCode") or "").strip()
+    intent_fallback_used = False
+    if preferred_intent_code and any(
+        str(intent.intentCode or "").strip() == preferred_intent_code
         for intent in intents
-        if str(intent.intentCode or "").strip()
-    ]
+    ):
+        matched = _select_fallback_intent(
+            intents,
+            preferred_intent_code=preferred_intent_code,
+        )
+    else:
+        matched = _select_fallback_intent(intents)
+        intent_fallback_used = True
 
+    slots_raw = candidate_raw.get("slots")
+    slots: dict[str, Any] = slots_raw if isinstance(slots_raw, dict) else {}
+    slot_whitelist = {str(key).strip() for key in (matched.slotKeys or []) if str(key).strip()}
+    if slot_whitelist:
+        slots = {k: v for k, v in slots.items() if str(k).strip() in slot_whitelist}
 
-def _build_repair_messages(
-    payload: SessionInferRequest,
-    failed_output: dict[str, Any],
-    failure_reason: str,
-) -> list[dict[str, Any]]:
-    candidate_brief_json = json.dumps(
-        _build_candidate_brief(payload.intents),
-        ensure_ascii=False,
-        indent=2,
+    need_clarify = _to_bool(
+        candidate_raw.get("needClarify"),
+        default=intent_fallback_used,
     )
-    failed_output_json = json.dumps(
-        failed_output or {},
-        ensure_ascii=False,
-        indent=2,
-        default=str,
+    clarify_question = str(candidate_raw.get("clarifyQuestion") or "").strip() or None
+    if intent_fallback_used:
+        need_clarify = True
+        if not clarify_question:
+            clarify_question = "请补充更明确的业务意图或关键筛选条件。"
+    elif not need_clarify:
+        clarify_question = None
+
+    confidence = _to_confidence(candidate_raw.get("confidence"), default=0.0)
+    if need_clarify and confidence > 0.4:
+        confidence = 0.4
+
+    execution_mode = str(matched.executionMode or "").strip() or str(
+        candidate_raw.get("executionMode") or "",
+    ).strip() or "SQL_TEMPLATE"
+
+    candidate = CandidatePlan(
+        intentCode=str(matched.intentCode or "").strip(),
+        executionMode=execution_mode,
+        confidence=confidence,
+        slots=slots,
+        needClarify=need_clarify,
+        clarifyQuestion=clarify_question,
+        roleCode=matched.roleCode,
+        sqlTemplateCode=matched.sqlTemplateCode,
+        selectedTableId=matched.selectedTableId,
     )
-    system_prompt = (
-        "你是受控查询规划链路中的结构化修复器。\n"
-        "你会收到一次不合法的 candidatePlan，请只做修复，不要扩展语义。\n"
-        "仅返回 JSON，不要 markdown，不要解释。\n"
-        "硬约束：\n"
-        "- candidatePlan.intentCode 必须来自 allowedIntents.intentCode，且非空。\n"
-        "- candidatePlan.executionMode 必须与选中 intentCode 对应项一致，且非空。\n"
-        "- candidatePlan.roleCode/sqlTemplateCode/selectedTableId 必须与选中 intent 对齐。\n"
-        "- confidence 必须在 [0,1]。\n"
-        "- 信息不足时：needClarify=true，并给出简短 clarifyQuestion。\n"
-        "输出格式必须为 {\"candidatePlan\": {...}, \"modelMeta\": {...}}。"
+    reason = (
+        "local_repair_fallback_intent"
+        if intent_fallback_used
+        else "local_repair_keep_intent"
     )
-    user_prompt = (
-        f"traceId: {payload.traceId}\n"
-        f"question: {payload.question}\n"
-        f"failureReason: {failure_reason}\n"
-        f"allowedIntents: {candidate_brief_json}\n"
-        f"invalidOutput: {failed_output_json}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    return candidate, reason
 
 
 def _resolve_effective_model_meta(agent_id: str, trace_id: str) -> ModelMeta:
@@ -539,15 +591,6 @@ def _build_candidate_plan(
     )
 
 
-def _extract_candidate_intent_code(output_raw: Any) -> str:
-    if not isinstance(output_raw, dict):
-        return ""
-    candidate_raw = output_raw.get("candidatePlan")
-    if isinstance(candidate_raw, dict):
-        return str(candidate_raw.get("intentCode") or "").strip()
-    return str(output_raw.get("intentCode") or "").strip()
-
-
 def _select_fallback_intent(
     intents: list[SessionInferIntent],
     preferred_intent_code: str = "",
@@ -573,26 +616,6 @@ def _select_fallback_intent(
             return intent
 
     raise ValueError("No valid intentCode found in provided intents")
-
-
-def _build_clarify_candidate_plan(
-    intents: list[SessionInferIntent],
-    preferred_intent_code: str = "",
-    clarify_question: str = "请确认客户编号与产品后，我再为你查询。",
-) -> CandidatePlan:
-    matched = _select_fallback_intent(intents, preferred_intent_code=preferred_intent_code)
-    return CandidatePlan(
-        intentCode=str(matched.intentCode or "").strip(),
-        executionMode=str(matched.executionMode or "").strip() or "SQL_TEMPLATE",
-        confidence=0.0,
-        slots={},
-        needClarify=True,
-        clarifyQuestion=clarify_question,
-        roleCode=matched.roleCode,
-        sqlTemplateCode=matched.sqlTemplateCode,
-        selectedTableId=matched.selectedTableId,
-    )
-
 
 async def _resolve_target_agent_id(
     request: Request,
@@ -643,28 +666,73 @@ async def post_session_infer(
         messages = _build_messages(payload)
         build_prompt_ms = int((time.monotonic() - build_prompt_start) * 1000)
 
+        fallback_reason_enum = "none"
         model_call_start = time.monotonic()
         structured_enabled = True
+        non_stream_enforced = True
+        structured_error_type = ""
         try:
             response = await model(
                 messages,
                 structured_model=SessionInferStructuredOutput,
+                stream=False,
             )
-        except Exception:
+        except TypeError as exc:
+            non_stream_enforced = False
+            try:
+                response = await model(
+                    messages,
+                    structured_model=SessionInferStructuredOutput,
+                )
+                structured_error_type = ""
+            except Exception as fallback_exc:
+                structured_enabled = False
+                structured_error_type = type(fallback_exc).__name__
+                logger.warning(
+                    "session infer structured model call failed after stream-override fallback, use local deterministic path",
+                    exc_info=True,
+                )
+                response = None
+                fallback_reason_enum = "structured_call_failed"
+        except Exception as exc:
             structured_enabled = False
+            structured_error_type = type(exc).__name__
             logger.warning(
-                "session infer structured model call failed, fallback to plain call",
+                "session infer structured model call failed, fallback to local deterministic path",
                 exc_info=True,
             )
-            response = await model(messages)
+            response = None
+            fallback_reason_enum = "structured_call_failed"
         model_call_ms = int((time.monotonic() - model_call_start) * 1000)
 
         collect_start = time.monotonic()
-        response_text, response_metadata, response_tool_candidate = await _collect_model_output(
-            response,
-            max_duration_ms=SESSION_INFER_COLLECT_BUDGET_MS,
-        )
+        if response is not None:
+            (
+                response_text,
+                response_metadata,
+                response_tool_candidate,
+                first_chunk_ms,
+                stream_chunk_count,
+                valid_metadata_at_chunk_idx,
+                collect_budget_cut,
+            ) = await _collect_model_output(
+                response,
+                max_duration_ms=SESSION_INFER_COLLECT_BUDGET_MS,
+                stop_on_usable_metadata=True,
+            )
+        else:
+            (
+                response_text,
+                response_metadata,
+                response_tool_candidate,
+                first_chunk_ms,
+                stream_chunk_count,
+                valid_metadata_at_chunk_idx,
+                collect_budget_cut,
+            ) = ("", None, None, None, 0, None, False)
         collect_ms = int((time.monotonic() - collect_start) * 1000)
+        if collect_budget_cut and fallback_reason_enum == "none":
+            fallback_reason_enum = "collect_budget_cut"
 
         parse_start = time.monotonic()
         metadata_keys: list[str] = (
@@ -675,26 +743,29 @@ async def post_session_infer(
         metadata_usable = _metadata_is_usable(response_metadata)
         if response_metadata is not None and not metadata_usable:
             logger.warning(
-                "session infer metadata incomplete, fallback to text parse trace_id=%s metadata_keys=%s",
+                "session infer metadata incomplete, fallback to local deterministic path trace_id=%s metadata_keys=%s",
                 trace_id,
                 metadata_keys,
             )
+            if fallback_reason_enum == "none":
+                fallback_reason_enum = "metadata_incomplete"
 
         tool_candidate_hit = isinstance(response_tool_candidate, dict)
         if metadata_usable and response_metadata is not None:
             response_json = response_metadata
         elif tool_candidate_hit and response_tool_candidate is not None:
             response_json = response_tool_candidate
+            if fallback_reason_enum == "none":
+                fallback_reason_enum = "tool_candidate_fallback"
         else:
-            try:
-                response_json = _extract_first_json_object(response_text)
-            except ValueError:
-                logger.warning(
-                    "session infer text parse failed, fallback to clarify trace_id=%s text_len=%d",
-                    trace_id,
-                    len(response_text or ""),
-                )
-                response_json = _build_clarify_fallback_output(payload)
+            response_json = {}
+            logger.warning(
+                "session infer missing structured payload, fallback to local deterministic repair trace_id=%s text_len=%d",
+                trace_id,
+                len(response_text or ""),
+            )
+            if fallback_reason_enum == "none":
+                fallback_reason_enum = "missing_structured_payload"
         parse_ms = int((time.monotonic() - parse_start) * 1000)
 
         candidate_start = time.monotonic()
@@ -704,91 +775,28 @@ async def post_session_infer(
         try:
             candidate = _build_candidate_plan(response_json, payload.intents)
         except Exception as candidate_exc:
-            preferred_intent_code = _extract_candidate_intent_code(response_json)
             logger.warning(
-                "session infer candidate invalid, fallback to clarify trace_id=%s reason=%s preferred_intent=%s",
+                "session infer candidate invalid, fallback to local deterministic repair trace_id=%s reason=%s",
                 trace_id,
                 str(candidate_exc),
-                preferred_intent_code,
             )
-            elapsed_before_repair_ms = int((time.monotonic() - stage_start) * 1000)
-            if elapsed_before_repair_ms >= SESSION_INFER_REPAIR_START_DEADLINE_MS:
-                logger.warning(
-                    "session infer skip repair due to budget trace_id=%s elapsed_ms=%d deadline_ms=%d",
-                    trace_id,
-                    elapsed_before_repair_ms,
-                    SESSION_INFER_REPAIR_START_DEADLINE_MS,
-                )
-                candidate = _build_clarify_candidate_plan(
-                    payload.intents,
-                    preferred_intent_code=preferred_intent_code,
-                )
-            else:
-                repair_retry_used = True
-                repair_start = time.monotonic()
-                repair_response_json: dict[str, Any] = {}
-                try:
-                    repair_messages = _build_repair_messages(
-                        payload=payload,
-                        failed_output=response_json,
-                        failure_reason=str(candidate_exc),
-                    )
-                    repair_response = await model(
-                        repair_messages,
-                        structured_model=SessionInferStructuredOutput,
-                    )
-                except Exception:
-                    logger.warning(
-                        "session infer candidate repair structured call failed, fallback to plain call trace_id=%s",
-                        trace_id,
-                        exc_info=True,
-                    )
-                    try:
-                        repair_messages = _build_repair_messages(
-                            payload=payload,
-                            failed_output=response_json,
-                            failure_reason=str(candidate_exc),
-                        )
-                        repair_response = await model(repair_messages)
-                    except Exception:
-                        repair_response = None
-
-                if repair_response is not None:
-                    (
-                        repair_text,
-                        repair_metadata,
-                        repair_tool_candidate,
-                    ) = await _collect_model_output(
-                        repair_response,
-                        max_duration_ms=SESSION_INFER_REPAIR_COLLECT_BUDGET_MS,
-                    )
-                    repair_metadata_usable = _metadata_is_usable(repair_metadata)
-                    if repair_metadata_usable and repair_metadata is not None:
-                        repair_response_json = repair_metadata
-                    elif isinstance(repair_tool_candidate, dict):
-                        repair_response_json = repair_tool_candidate
-                    else:
-                        try:
-                            repair_response_json = _extract_first_json_object(repair_text)
-                        except ValueError:
-                            repair_response_json = {}
-
-                try:
-                    candidate = _build_candidate_plan(repair_response_json, payload.intents)
-                    repair_retry_success = True
-                except Exception as repair_exc:
-                    repaired_intent = _extract_candidate_intent_code(repair_response_json)
-                    logger.warning(
-                        "session infer candidate repair failed, fallback to clarify trace_id=%s reason=%s repaired_intent=%s",
-                        trace_id,
-                        str(repair_exc),
-                        repaired_intent,
-                    )
-                    candidate = _build_clarify_candidate_plan(
-                        payload.intents,
-                        preferred_intent_code=preferred_intent_code or repaired_intent,
-                    )
-                repair_retry_ms = int((time.monotonic() - repair_start) * 1000)
+            repair_start = time.monotonic()
+            candidate, local_repair_reason = _build_candidate_plan_local_repair(
+                response_json,
+                payload.intents,
+            )
+            repair_retry_used = True
+            repair_retry_success = True
+            repair_retry_ms = int((time.monotonic() - repair_start) * 1000)
+            if fallback_reason_enum == "none":
+                fallback_reason_enum = local_repair_reason
+            elif fallback_reason_enum not in {
+                "collect_budget_cut",
+                "metadata_incomplete",
+                "tool_candidate_fallback",
+                "missing_structured_payload",
+            }:
+                fallback_reason_enum = local_repair_reason
         candidate_ms = int((time.monotonic() - candidate_start) * 1000)
         model_meta = _resolve_effective_model_meta(
             target_agent_id,
@@ -803,7 +811,7 @@ async def post_session_infer(
                 SESSION_INFER_TOTAL_BUDGET_MS,
             )
         logger.info(
-            "session infer timing trace_id=%s intents=%d resolve_agent_ms=%d model_create_ms=%d build_prompt_ms=%d model_call_ms=%d collect_ms=%d parse_ms=%d candidate_ms=%d repair_retry_used=%s repair_retry_success=%s repair_retry_ms=%d total_ms=%d structured_enabled=%s metadata_hit=%s metadata_usable=%s metadata_keys=%s tool_candidate_hit=%s",
+            "session infer timing trace_id=%s intents=%d resolve_agent_ms=%d model_create_ms=%d build_prompt_ms=%d model_call_ms=%d collect_ms=%d parse_ms=%d candidate_ms=%d repair_retry_used=%s repair_retry_success=%s repair_retry_ms=%d total_ms=%d structured_enabled=%s non_stream_enforced=%s metadata_hit=%s metadata_usable=%s metadata_keys=%s tool_candidate_hit=%s first_chunk_ms=%s stream_chunk_count=%d valid_metadata_at_chunk_idx=%s collect_budget_cut=%s fallback_reason_enum=%s structured_error_type=%s",
             trace_id,
             len(payload.intents),
             resolve_ms,
@@ -818,10 +826,17 @@ async def post_session_infer(
             repair_retry_ms,
             total_ms,
             structured_enabled,
+            non_stream_enforced,
             response_metadata is not None,
             metadata_usable,
             metadata_keys,
             tool_candidate_hit,
+            first_chunk_ms,
+            stream_chunk_count,
+            valid_metadata_at_chunk_idx,
+            collect_budget_cut,
+            fallback_reason_enum,
+            structured_error_type,
         )
         return SessionInferResponse(
             code=0,
