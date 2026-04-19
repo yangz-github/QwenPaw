@@ -251,19 +251,19 @@ async def _collect_model_output(
 def _build_clarify_fallback_output(
     payload: SessionInferRequest,
 ) -> dict[str, Any]:
-    first_intent = payload.intents[0]
+    fallback_intent = _select_fallback_intent(payload.intents)
     clarify_question = "请确认客户编号与产品后，我再为你查询。"
     return {
         "candidatePlan": {
-            "intentCode": str(first_intent.intentCode or "").strip(),
-            "executionMode": str(first_intent.executionMode or "").strip(),
+            "intentCode": str(fallback_intent.intentCode or "").strip(),
+            "executionMode": str(fallback_intent.executionMode or "").strip(),
             "confidence": 0.0,
             "slots": {},
             "needClarify": True,
             "clarifyQuestion": clarify_question,
-            "roleCode": first_intent.roleCode,
-            "sqlTemplateCode": first_intent.sqlTemplateCode,
-            "selectedTableId": first_intent.selectedTableId,
+            "roleCode": fallback_intent.roleCode,
+            "sqlTemplateCode": fallback_intent.sqlTemplateCode,
+            "selectedTableId": fallback_intent.selectedTableId,
         },
         "modelMeta": {},
     }
@@ -330,6 +330,61 @@ def _build_messages(payload: SessionInferRequest) -> list[dict[str, Any]]:
         f"routingPolicy: {routing_policy_json}\n"
         f"outputSchema: {output_schema_json}\n"
         f"intents: {intents_json}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _build_candidate_brief(intents: list[SessionInferIntent]) -> list[dict[str, Any]]:
+    return [
+        {
+            "intentCode": str(intent.intentCode or "").strip(),
+            "executionMode": str(intent.executionMode or "").strip(),
+            "roleCode": intent.roleCode,
+            "sqlTemplateCode": intent.sqlTemplateCode,
+            "selectedTableId": intent.selectedTableId,
+        }
+        for intent in intents
+        if str(intent.intentCode or "").strip()
+    ]
+
+
+def _build_repair_messages(
+    payload: SessionInferRequest,
+    failed_output: dict[str, Any],
+    failure_reason: str,
+) -> list[dict[str, Any]]:
+    candidate_brief_json = json.dumps(
+        _build_candidate_brief(payload.intents),
+        ensure_ascii=False,
+        indent=2,
+    )
+    failed_output_json = json.dumps(
+        failed_output or {},
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    system_prompt = (
+        "你是受控查询规划链路中的结构化修复器。\n"
+        "你会收到一次不合法的 candidatePlan，请只做修复，不要扩展语义。\n"
+        "仅返回 JSON，不要 markdown，不要解释。\n"
+        "硬约束：\n"
+        "- candidatePlan.intentCode 必须来自 allowedIntents.intentCode，且非空。\n"
+        "- candidatePlan.executionMode 必须与选中 intentCode 对应项一致，且非空。\n"
+        "- candidatePlan.roleCode/sqlTemplateCode/selectedTableId 必须与选中 intent 对齐。\n"
+        "- confidence 必须在 [0,1]。\n"
+        "- 信息不足时：needClarify=true，并给出简短 clarifyQuestion。\n"
+        "输出格式必须为 {\"candidatePlan\": {...}, \"modelMeta\": {...}}。"
+    )
+    user_prompt = (
+        f"traceId: {payload.traceId}\n"
+        f"question: {payload.question}\n"
+        f"failureReason: {failure_reason}\n"
+        f"allowedIntents: {candidate_brief_json}\n"
+        f"invalidOutput: {failed_output_json}"
     )
     return [
         {"role": "system", "content": system_prompt},
@@ -469,6 +524,61 @@ def _build_candidate_plan(
     )
 
 
+def _extract_candidate_intent_code(output_raw: Any) -> str:
+    if not isinstance(output_raw, dict):
+        return ""
+    candidate_raw = output_raw.get("candidatePlan")
+    if isinstance(candidate_raw, dict):
+        return str(candidate_raw.get("intentCode") or "").strip()
+    return str(output_raw.get("intentCode") or "").strip()
+
+
+def _select_fallback_intent(
+    intents: list[SessionInferIntent],
+    preferred_intent_code: str = "",
+) -> SessionInferIntent:
+    if not intents:
+        raise ValueError("No intents provided")
+
+    wanted = preferred_intent_code.strip()
+    if wanted:
+        for intent in intents:
+            if (
+                str(intent.intentCode or "").strip() == wanted
+                and str(intent.executionMode or "").strip()
+            ):
+                return intent
+
+    for intent in intents:
+        if str(intent.intentCode or "").strip() and str(intent.executionMode or "").strip():
+            return intent
+
+    for intent in intents:
+        if str(intent.intentCode or "").strip():
+            return intent
+
+    raise ValueError("No valid intentCode found in provided intents")
+
+
+def _build_clarify_candidate_plan(
+    intents: list[SessionInferIntent],
+    preferred_intent_code: str = "",
+    clarify_question: str = "请确认客户编号与产品后，我再为你查询。",
+) -> CandidatePlan:
+    matched = _select_fallback_intent(intents, preferred_intent_code=preferred_intent_code)
+    return CandidatePlan(
+        intentCode=str(matched.intentCode or "").strip(),
+        executionMode=str(matched.executionMode or "").strip() or "SQL_TEMPLATE",
+        confidence=0.0,
+        slots={},
+        needClarify=True,
+        clarifyQuestion=clarify_question,
+        roleCode=matched.roleCode,
+        sqlTemplateCode=matched.sqlTemplateCode,
+        selectedTableId=matched.selectedTableId,
+    )
+
+
 async def _resolve_target_agent_id(
     request: Request,
     payload: SessionInferRequest,
@@ -572,7 +682,81 @@ async def post_session_infer(
         parse_ms = int((time.monotonic() - parse_start) * 1000)
 
         candidate_start = time.monotonic()
-        candidate = _build_candidate_plan(response_json, payload.intents)
+        repair_retry_used = False
+        repair_retry_success = False
+        repair_retry_ms = 0
+        try:
+            candidate = _build_candidate_plan(response_json, payload.intents)
+        except Exception as candidate_exc:
+            preferred_intent_code = _extract_candidate_intent_code(response_json)
+            logger.warning(
+                "session infer candidate invalid, fallback to clarify trace_id=%s reason=%s preferred_intent=%s",
+                trace_id,
+                str(candidate_exc),
+                preferred_intent_code,
+            )
+            repair_retry_used = True
+            repair_start = time.monotonic()
+            repair_response_json: dict[str, Any] = {}
+            try:
+                repair_messages = _build_repair_messages(
+                    payload=payload,
+                    failed_output=response_json,
+                    failure_reason=str(candidate_exc),
+                )
+                repair_response = await model(
+                    repair_messages,
+                    structured_model=SessionInferStructuredOutput,
+                )
+            except Exception:
+                logger.warning(
+                    "session infer candidate repair structured call failed, fallback to plain call trace_id=%s",
+                    trace_id,
+                    exc_info=True,
+                )
+                try:
+                    repair_messages = _build_repair_messages(
+                        payload=payload,
+                        failed_output=response_json,
+                        failure_reason=str(candidate_exc),
+                    )
+                    repair_response = await model(repair_messages)
+                except Exception:
+                    repair_response = None
+
+            if repair_response is not None:
+                (
+                    repair_text,
+                    repair_metadata,
+                    repair_tool_candidate,
+                ) = await _collect_model_output(repair_response)
+                repair_metadata_usable = _metadata_is_usable(repair_metadata)
+                if repair_metadata_usable and repair_metadata is not None:
+                    repair_response_json = repair_metadata
+                elif isinstance(repair_tool_candidate, dict):
+                    repair_response_json = repair_tool_candidate
+                else:
+                    try:
+                        repair_response_json = _extract_first_json_object(repair_text)
+                    except ValueError:
+                        repair_response_json = {}
+
+            try:
+                candidate = _build_candidate_plan(repair_response_json, payload.intents)
+                repair_retry_success = True
+            except Exception as repair_exc:
+                repaired_intent = _extract_candidate_intent_code(repair_response_json)
+                logger.warning(
+                    "session infer candidate repair failed, fallback to clarify trace_id=%s reason=%s repaired_intent=%s",
+                    trace_id,
+                    str(repair_exc),
+                    repaired_intent,
+                )
+                candidate = _build_clarify_candidate_plan(
+                    payload.intents,
+                    preferred_intent_code=preferred_intent_code or repaired_intent,
+                )
+            repair_retry_ms = int((time.monotonic() - repair_start) * 1000)
         candidate_ms = int((time.monotonic() - candidate_start) * 1000)
         model_meta = _resolve_effective_model_meta(
             target_agent_id,
@@ -580,7 +764,7 @@ async def post_session_infer(
         )
         total_ms = int((time.monotonic() - stage_start) * 1000)
         logger.info(
-            "session infer timing trace_id=%s intents=%d resolve_agent_ms=%d model_create_ms=%d build_prompt_ms=%d model_call_ms=%d collect_ms=%d parse_ms=%d candidate_ms=%d total_ms=%d structured_enabled=%s metadata_hit=%s metadata_usable=%s metadata_keys=%s tool_candidate_hit=%s",
+            "session infer timing trace_id=%s intents=%d resolve_agent_ms=%d model_create_ms=%d build_prompt_ms=%d model_call_ms=%d collect_ms=%d parse_ms=%d candidate_ms=%d repair_retry_used=%s repair_retry_success=%s repair_retry_ms=%d total_ms=%d structured_enabled=%s metadata_hit=%s metadata_usable=%s metadata_keys=%s tool_candidate_hit=%s",
             trace_id,
             len(payload.intents),
             resolve_ms,
@@ -590,6 +774,9 @@ async def post_session_infer(
             collect_ms,
             parse_ms,
             candidate_ms,
+            repair_retry_used,
+            repair_retry_success,
+            repair_retry_ms,
             total_ms,
             structured_enabled,
             response_metadata is not None,
