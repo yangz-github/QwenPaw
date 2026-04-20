@@ -255,24 +255,48 @@ def _normalize_structured_metadata(raw: Any) -> Optional[dict[str, Any]]:
 
 
 def _extract_intent_code_from_metadata(metadata: dict[str, Any]) -> str:
-    candidate_raw = metadata.get("candidatePlan")
+    payload = _normalize_structured_payload(metadata)
+    candidate_raw = payload.get("candidatePlan")
     if isinstance(candidate_raw, dict):
         intent_code = str(candidate_raw.get("intentCode") or "").strip()
         if intent_code:
             return intent_code
-    return str(metadata.get("intentCode") or "").strip()
+    return str(payload.get("intentCode") or "").strip()
+
+
+def _normalize_structured_payload(raw: Any) -> dict[str, Any]:
+    """
+    Normalize provider-specific wrappers to a stable dict payload.
+    Handles nested wrappers like {"structuredOutput": {...}} and {"candidatePlan": {...}}.
+    """
+    payload = _normalize_structured_metadata(raw)
+    if not isinstance(payload, dict):
+        return {}
+    current = payload
+    for _ in range(6):
+        wrapped = _normalize_structured_metadata(current.get("structuredOutput"))
+        if isinstance(wrapped, dict):
+            current = wrapped
+            continue
+        nested = _normalize_structured_metadata(current.get("candidatePlan"))
+        if isinstance(nested, dict) and not str(current.get("intentCode") or "").strip():
+            current = nested
+            continue
+        break
+    return current
 
 
 def _metadata_is_usable(metadata: Optional[dict[str, Any]]) -> bool:
-    if not isinstance(metadata, dict):
+    payload = _normalize_structured_payload(metadata)
+    if not isinstance(payload, dict) or not payload:
         return False
-    candidate_raw = _normalize_structured_metadata(metadata.get("candidatePlan"))
+    candidate_raw = _normalize_structured_metadata(payload.get("candidatePlan"))
     if isinstance(candidate_raw, dict):
         intent_code = str(candidate_raw.get("intentCode") or "").strip()
         execution_mode = str(candidate_raw.get("executionMode") or "").strip()
         return bool(intent_code and execution_mode)
-    intent_code = str(metadata.get("intentCode") or "").strip()
-    execution_mode = str(metadata.get("executionMode") or "").strip()
+    intent_code = str(payload.get("intentCode") or "").strip()
+    execution_mode = str(payload.get("executionMode") or "").strip()
     return bool(intent_code and execution_mode)
 
 
@@ -746,9 +770,10 @@ def _build_candidate_plan(
     output_raw: dict[str, Any],
     intents: list[SessionInferIntent],
 ) -> CandidatePlan:
-    candidate_raw = _normalize_structured_metadata(output_raw.get("candidatePlan"))
+    normalized_output = _normalize_structured_payload(output_raw)
+    candidate_raw = _normalize_structured_metadata(normalized_output.get("candidatePlan"))
     if not isinstance(candidate_raw, dict):
-        candidate_raw = output_raw
+        candidate_raw = normalized_output or output_raw
     for _ in range(5):
         intent_code_probe = str(candidate_raw.get("intentCode") or "").strip()
         execution_mode_probe = str(candidate_raw.get("executionMode") or "").strip()
