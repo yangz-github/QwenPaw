@@ -235,6 +235,17 @@ async def _collect_model_text(response: Any) -> str:
 def _normalize_structured_metadata(raw: Any) -> Optional[dict[str, Any]]:
     if isinstance(raw, dict):
         return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+        return None
     model_dump = getattr(raw, "model_dump", None)
     if callable(model_dump):
         dumped = model_dump()
@@ -738,6 +749,15 @@ def _build_candidate_plan(
     candidate_raw = _normalize_structured_metadata(output_raw.get("candidatePlan"))
     if not isinstance(candidate_raw, dict):
         candidate_raw = output_raw
+    for _ in range(5):
+        intent_code_probe = str(candidate_raw.get("intentCode") or "").strip()
+        execution_mode_probe = str(candidate_raw.get("executionMode") or "").strip()
+        if intent_code_probe or execution_mode_probe:
+            break
+        nested_candidate = _normalize_structured_metadata(candidate_raw.get("candidatePlan"))
+        if not isinstance(nested_candidate, dict):
+            break
+        candidate_raw = nested_candidate
 
     intent_map = {
         str(intent.intentCode).strip(): intent
