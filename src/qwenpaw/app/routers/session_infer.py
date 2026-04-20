@@ -181,20 +181,11 @@ def _extract_intent_code_from_metadata(metadata: dict[str, Any]) -> str:
 def _metadata_is_usable(metadata: Optional[dict[str, Any]]) -> bool:
     if not isinstance(metadata, dict):
         return False
-    candidate_raw = metadata.get("candidatePlan")
+    candidate_raw = _normalize_structured_metadata(metadata.get("candidatePlan"))
     if isinstance(candidate_raw, dict):
         intent_code = str(candidate_raw.get("intentCode") or "").strip()
         execution_mode = str(candidate_raw.get("executionMode") or "").strip()
-        has_confidence = "confidence" in candidate_raw
-        has_need_clarify = "needClarify" in candidate_raw
-        has_slots = isinstance(candidate_raw.get("slots"), dict)
-        return bool(
-            intent_code
-            and execution_mode
-            and has_confidence
-            and has_need_clarify
-            and has_slots
-        )
+        return bool(intent_code and execution_mode)
     intent_code = str(metadata.get("intentCode") or "").strip()
     execution_mode = str(metadata.get("executionMode") or "").strip()
     return bool(intent_code and execution_mode)
@@ -414,8 +405,8 @@ def _required_slot_keys(intent: SessionInferIntent) -> list[str]:
 
 
 def _slot_mapping(intent: SessionInferIntent) -> dict[str, list[str]]:
-    data = _intent_data(intent)
-    mapping_raw = data.get("slotMapping")
+    slot_schema = intent.slotSchema if isinstance(intent.slotSchema, dict) else {}
+    mapping_raw = slot_schema.get("slotMapping")
     if not isinstance(mapping_raw, dict):
         return {}
     normalized: dict[str, list[str]] = {}
@@ -685,7 +676,7 @@ def _build_candidate_plan(
     output_raw: dict[str, Any],
     intents: list[SessionInferIntent],
 ) -> CandidatePlan:
-    candidate_raw = output_raw.get("candidatePlan")
+    candidate_raw = _normalize_structured_metadata(output_raw.get("candidatePlan"))
     if not isinstance(candidate_raw, dict):
         candidate_raw = output_raw
 
@@ -924,13 +915,12 @@ async def post_session_infer(
 
         tool_candidate_hit = isinstance(response_tool_candidate, dict)
         response_source = "none"
-        if metadata_usable and response_metadata is not None:
-            response_json = response_metadata
-            response_source = "metadata"
-        elif tool_candidate_hit and response_tool_candidate is not None:
-            response_json = response_tool_candidate
-            response_source = "tool_candidate"
-        else:
+        source_candidates: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(response_metadata, dict):
+            source_candidates.append(("metadata", response_metadata))
+        if tool_candidate_hit and response_tool_candidate is not None:
+            source_candidates.append(("tool_candidate", response_tool_candidate))
+        if not source_candidates:
             raise ValueError(
                 "Missing usable structured payload from model output: "
                 f"trace_id={trace_id} text_len={len(response_text or '')}",
@@ -941,7 +931,26 @@ async def post_session_infer(
         slot_completion_changed = False
         slot_completion_filled = 0
         slot_completion_missing_required: list[str] = []
-        candidate = _build_candidate_plan(response_json, payload.intents)
+        candidate: Optional[CandidatePlan] = None
+        candidate_errors: list[str] = []
+        for source_name, source_payload in source_candidates:
+            try:
+                candidate = _build_candidate_plan(source_payload, payload.intents)
+                response_source = source_name
+                break
+            except ValueError as exc:
+                candidate_errors.append(f"{source_name}:{exc}")
+                logger.warning(
+                    "session infer candidate parse failed trace_id=%s source=%s reason=%s",
+                    trace_id,
+                    source_name,
+                    str(exc),
+                )
+        if candidate is None:
+            raise ValueError(
+                "Failed to build candidatePlan from model output: "
+                + "; ".join(candidate_errors)
+            )
         (
             candidate,
             slot_completion_changed,
