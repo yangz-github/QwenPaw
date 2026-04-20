@@ -116,6 +116,34 @@ def _truncate_for_log(value: Any, max_chars: int = SESSION_INFER_LOG_MAX_TEXT_CH
     return text[:max_chars] + "...(truncated)"
 
 
+def _json_default_for_log(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, set):
+        return sorted(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    if hasattr(value, "__dict__"):
+        return value.__dict__
+    return str(value)
+
+
+def _json_for_log(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default_for_log,
+    )
+
+
 def _intent_log_summary(intent: SessionInferIntent) -> dict[str, Any]:
     required_slots = _required_slot_keys(intent)
     slot_mapping = _slot_mapping(intent)
@@ -857,7 +885,7 @@ async def post_session_infer(
         "payloadAgentId": payload.agentId,
         "headerAgentId": x_agent_id,
     }
-    logger.info("session infer request summary=%s", request_summary)
+    logger.info("session infer request summary=%s", _json_for_log(request_summary))
     if payload.intents:
         intent_summaries = [
             _intent_log_summary(intent)
@@ -866,7 +894,7 @@ async def post_session_infer(
         logger.info(
             "session infer intents summary trace_id=%s intents=%s",
             trace_id,
-            intent_summaries,
+            _json_for_log(intent_summaries),
         )
     try:
         resolve_start = time.monotonic()
@@ -996,7 +1024,9 @@ async def post_session_infer(
             collect_ms,
             len(response_text or ""),
             isinstance(response_metadata, dict),
-            sorted(response_metadata.keys()) if isinstance(response_metadata, dict) else [],
+            _json_for_log(
+                sorted(response_metadata.keys()) if isinstance(response_metadata, dict) else []
+            ),
             _metadata_is_usable(response_metadata),
             isinstance(response_tool_candidate, dict),
             first_chunk_ms,
@@ -1016,7 +1046,7 @@ async def post_session_infer(
             logger.warning(
                 "session infer metadata incomplete trace_id=%s metadata_keys=%s",
                 trace_id,
-                metadata_keys,
+                _json_for_log(metadata_keys),
             )
 
         tool_candidate_hit = isinstance(response_tool_candidate, dict)
@@ -1044,7 +1074,7 @@ async def post_session_infer(
             "session infer stage=parse_payload trace_id=%s parse_ms=%d source_candidates=%s",
             trace_id,
             parse_ms,
-            source_summaries,
+            _json_for_log(source_summaries),
         )
 
         candidate_start = time.monotonic()
@@ -1088,11 +1118,11 @@ async def post_session_infer(
             "session infer stage=candidate trace_id=%s response_source=%s candidate_before=%s candidate_after=%s slot_completion_changed=%s slot_completion_filled=%d slot_completion_missing_required=%s",
             trace_id,
             response_source,
-            candidate_before_enforce,
-            candidate_after_enforce,
+            _json_for_log(candidate_before_enforce),
+            _json_for_log(candidate_after_enforce),
             slot_completion_changed,
             slot_completion_filled,
-            slot_completion_missing_required,
+            _json_for_log(slot_completion_missing_required),
         )
         if slot_completion_changed:
             logger.info(
@@ -1100,7 +1130,7 @@ async def post_session_infer(
                 trace_id,
                 candidate.intentCode,
                 slot_completion_filled,
-                slot_completion_missing_required,
+                _json_for_log(slot_completion_missing_required),
                 candidate.needClarify,
             )
         candidate_ms = int((time.monotonic() - candidate_start) * 1000)
@@ -1111,7 +1141,7 @@ async def post_session_infer(
         logger.info(
             "session infer stage=resolve_model_meta trace_id=%s model_meta=%s",
             trace_id,
-            model_meta.model_dump(),
+            _json_for_log(model_meta.model_dump()),
         )
         total_ms = int((time.monotonic() - stage_start) * 1000)
         if total_ms > SESSION_INFER_TOTAL_BUDGET_MS:
@@ -1135,13 +1165,13 @@ async def post_session_infer(
             response_source,
             slot_completion_changed,
             slot_completion_filled,
-            slot_completion_missing_required,
+            _json_for_log(slot_completion_missing_required),
             total_ms,
             structured_enabled,
             non_stream_enforced,
             response_metadata is not None,
             metadata_usable,
-            metadata_keys,
+            _json_for_log(metadata_keys),
             tool_candidate_hit,
             first_chunk_ms,
             stream_chunk_count,
