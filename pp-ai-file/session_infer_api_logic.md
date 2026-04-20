@@ -43,7 +43,7 @@
 4. 创建模型实例
 5. 构造 prompt（system + user）
 6. 调用结构化模型输出
-7. 收集模型输出（流式/非流式，**无预算截断**）
+7. 收集模型输出（流式/非流式）
 8. 从 `metadata/tool_candidate` 解析 source candidates
 9. 构建 `candidatePlan`（强校验）
 10. 槽位补全与澄清判定
@@ -158,6 +158,11 @@
 
 函数：`_build_candidate_plan(output_raw, intents)`
 
+预处理：
+
+- 先对 `output_raw` 做 `_normalize_structured_payload` 标准化
+- 再对 `candidatePlan` 做最多 5 层的嵌套解包（`candidatePlan -> candidatePlan -> ...`），兼容部分模型/供应商的重复包装
+
 校验规则（关键）：
 
 1. `intentCode` 必填且必须在请求 intents 中
@@ -256,22 +261,25 @@
 ### 11.2 关键日志点
 
 - 请求入口：
-  - `session infer request payload=%s`（直接 `payload.model_dump()`）
-- intents 摘要
+  - `会话推理请求载荷 payload=%s`（直接 `payload.model_dump()`）
 - 阶段耗时：
-  - `resolve_agent`
-  - `create_model`
-  - `build_prompt`
-  - `model_call`
-  - `collect_output`
-  - `parse_payload`
-  - `candidate`
-  - `resolve_model_meta`
-  - `timing`（总览）
+  - `会话推理阶段=解析agent`
+  - `会话推理阶段=创建模型`
+  - `会话推理阶段=构建提示词`
+  - `会话推理阶段=模型调用`
+  - `会话推理阶段=收集输出`
+  - `会话推理阶段=解析载荷`
+  - `会话推理阶段=candidate处理`
+  - `会话推理阶段=解析模型元信息`
+  - `会话推理耗时汇总`（总览）
 - 数据调试：
-  - `collect metadata`
-  - `collect tool_candidate`
+  - `会话推理收集结果-metadata`
+  - `会话推理收集结果-tool_candidate`
   - `candidate_before/candidate_after`
+- 常见告警/错误：
+  - `会话推理metadata不完整`
+  - `会话推理candidate解析失败`
+  - `会话推理失败`
 
 ---
 
@@ -310,14 +318,14 @@ sequenceDiagram
     participant Parser as Candidate Builder
 
     Client->>API: POST /qwenpaw/session/infer
-    API->>API: log request payload
+    API->>API: 记录请求payload日志
     API->>Model: model(messages, structured_model=...)
     Model-->>API: response(stream/non-stream)
-    API->>API: collect output(metadata/tool_candidate)
-    API->>Parser: normalize structured payload
-    API->>Parser: build candidatePlan (metadata first, then tool_candidate)
+    API->>API: 收集输出(metadata/tool_candidate)
+    API->>Parser: 标准化结构化payload
+    API->>Parser: 构建candidatePlan(先metadata后tool_candidate)
     Parser-->>API: CandidatePlan(校验后)
-    API->>Parser: enforce slot completion
+    API->>Parser: 执行槽位补全
     Parser-->>API: CandidatePlan(补槽/clarify)
     API-->>Client: code=0, data={candidatePlan, modelMeta}
 ```
@@ -334,4 +342,3 @@ sequenceDiagram
 - candidate 校验规则
 - 槽位补全与映射规则（尤其 `slotSchema.slotMapping`）
 - 日志字段与阶段打点
-
