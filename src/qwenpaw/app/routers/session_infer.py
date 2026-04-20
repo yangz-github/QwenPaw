@@ -1026,6 +1026,17 @@ async def post_session_infer(
             stream_chunk_count,
             valid_metadata_at_chunk_idx,
         )
+        logger.info(
+            "会话推理模型响应完整快照 trace_id=%s snapshot=%s",
+            trace_id,
+            _json_for_log(
+                {
+                    "response_text": response_text,
+                    "response_metadata": response_metadata,
+                    "response_tool_candidate": response_tool_candidate,
+                }
+            ),
+        )
         parse_start = time.monotonic()
         metadata_keys: list[str] = (
             sorted(response_metadata.keys())
