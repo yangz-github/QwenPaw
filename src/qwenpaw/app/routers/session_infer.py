@@ -1021,6 +1021,16 @@ async def post_session_infer(
             stream_chunk_count,
             valid_metadata_at_chunk_idx,
         )
+        logger.info(
+            "session infer collect metadata trace_id=%s metadata=%s",
+            trace_id,
+            _json_for_log(response_metadata),
+        )
+        logger.info(
+            "session infer collect tool_candidate trace_id=%s tool_candidate=%s",
+            trace_id,
+            _json_for_log(response_tool_candidate),
+        )
 
         parse_start = time.monotonic()
         metadata_keys: list[str] = (
