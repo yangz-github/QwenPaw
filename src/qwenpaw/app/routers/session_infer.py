@@ -862,20 +862,7 @@ async def post_session_infer(
 ) -> SessionInferResponse:
     stage_start = time.monotonic()
     trace_id = (payload.traceId or "").strip()
-    request_summary = {
-        "traceId": trace_id,
-        "questionPreview": _truncate_for_log(payload.question),
-        "questionLength": len(payload.question or ""),
-        "intentsCount": len(payload.intents or []),
-        "routingPolicyKeys": sorted((payload.routingPolicy or {}).keys()),
-        "outputSchemaKeys": sorted((payload.outputSchema or {}).keys()),
-        "sessionId": payload.sessionId,
-        "conversationId": payload.conversationId,
-        "chatId": payload.chatId,
-        "payloadAgentId": payload.agentId,
-        "headerAgentId": x_agent_id,
-    }
-    logger.info("session infer request summary=%s", _json_for_log(request_summary))
+    logger.info("session infer request payload=%s", payload.model_dump())
     if payload.intents:
         intent_summaries = [
             _intent_log_summary(intent)
