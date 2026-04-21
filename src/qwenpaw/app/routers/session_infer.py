@@ -317,6 +317,7 @@ async def _collect_model_output(
     str,
     Optional[dict[str, Any]],
     Optional[dict[str, Any]],
+    Optional[str],
     Optional[int],
     int,
     Optional[int],
@@ -325,42 +326,54 @@ async def _collect_model_output(
         accumulated = ""
         metadata: Optional[dict[str, Any]] = None
         tool_candidate: Optional[dict[str, Any]] = None
+        collect_error: Optional[str] = None
         collect_started = time.monotonic()
         first_chunk_ms: Optional[int] = None
         chunk_count = 0
         valid_metadata_at_chunk_idx: Optional[int] = None
-        async for chunk in response:  # type: ignore[union-attr]
-            chunk_count += 1
-            if first_chunk_ms is None:
-                first_chunk_ms = int((time.monotonic() - collect_started) * 1000)
-            text = _extract_text_from_chunk(chunk)
-            if text:
-                # Some providers emit cumulative text on each chunk.
-                if len(text) >= len(accumulated) and text.startswith(accumulated):
-                    accumulated = text
-                else:
-                    accumulated += text
-            chunk_metadata = _normalize_structured_metadata(
-                getattr(chunk, "metadata", None),
+        try:
+            async for chunk in response:  # type: ignore[union-attr]
+                chunk_count += 1
+                if first_chunk_ms is None:
+                    first_chunk_ms = int((time.monotonic() - collect_started) * 1000)
+                text = _extract_text_from_chunk(chunk)
+                if text:
+                    # Some providers emit cumulative text on each chunk.
+                    if len(text) >= len(accumulated) and text.startswith(accumulated):
+                        accumulated = text
+                    else:
+                        accumulated += text
+                chunk_metadata = _normalize_structured_metadata(
+                    getattr(chunk, "metadata", None),
+                )
+                if chunk_metadata:
+                    metadata = chunk_metadata
+                    if (
+                        stop_on_usable_metadata
+                        and _metadata_is_usable(metadata)
+                        and valid_metadata_at_chunk_idx is None
+                    ):
+                        # Record first usable chunk index, but do not break.
+                        # Continue collecting full output for diagnostics.
+                        valid_metadata_at_chunk_idx = chunk_count
+                candidate = _extract_candidate_from_tool_content(
+                    getattr(chunk, "content", None),
+                )
+                if candidate:
+                    tool_candidate = candidate
+        except Exception as exc:
+            collect_error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "会话推理模型流式收集异常 accumulated_len=%d chunk_count=%d first_chunk_ms=%s",
+                len(accumulated),
+                chunk_count,
+                first_chunk_ms,
             )
-            if chunk_metadata:
-                metadata = chunk_metadata
-                if (
-                    stop_on_usable_metadata
-                    and _metadata_is_usable(metadata)
-                    and valid_metadata_at_chunk_idx is None
-                ):
-                    valid_metadata_at_chunk_idx = chunk_count
-                    break
-            candidate = _extract_candidate_from_tool_content(
-                getattr(chunk, "content", None),
-            )
-            if candidate:
-                tool_candidate = candidate
         return (
             accumulated,
             metadata,
             tool_candidate,
+            collect_error,
             first_chunk_ms,
             chunk_count,
             valid_metadata_at_chunk_idx,
@@ -376,6 +389,7 @@ async def _collect_model_output(
         response_text,
         metadata,
         tool_candidate,
+        None,
         0 if has_payload else None,
         1 if has_payload else 0,
         1 if (_metadata_is_usable(metadata)) else None,
@@ -999,22 +1013,24 @@ async def post_session_infer(
                 response_text,
                 response_metadata,
                 response_tool_candidate,
+                collect_error,
                 first_chunk_ms,
                 stream_chunk_count,
                 valid_metadata_at_chunk_idx,
             ) = await _collect_model_output(
                 response,
-                stop_on_usable_metadata=True,
+                stop_on_usable_metadata=False,
             )
         else:
             (
                 response_text,
                 response_metadata,
                 response_tool_candidate,
+                collect_error,
                 first_chunk_ms,
                 stream_chunk_count,
                 valid_metadata_at_chunk_idx,
-            ) = ("", None, None, None, 0, None)
+            ) = ("", None, None, None, None, 0, None)
         collect_ms = int((time.monotonic() - collect_start) * 1000)
         logger.info(
             "会话推理模型响应完整快照 trace_id=%s snapshot=%s",
@@ -1024,9 +1040,16 @@ async def post_session_infer(
                     "response_text": response_text,
                     "response_metadata": response_metadata,
                     "response_tool_candidate": response_tool_candidate,
+                    "collect_error": collect_error,
                 }
             ),
         )
+        if collect_error:
+            logger.warning(
+                "会话推理模型响应收集异常 trace_id=%s collect_error=%s",
+                trace_id,
+                collect_error,
+            )
         parse_start = time.monotonic()
         metadata_keys: list[str] = (
             sorted(response_metadata.keys())
