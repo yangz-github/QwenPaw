@@ -271,6 +271,32 @@ def _normalize_structured_payload(raw: Any) -> dict[str, Any]:
     return current
 
 
+def _extract_json_payload_from_text(text: str) -> Optional[dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    direct = _normalize_structured_metadata(raw)
+    if isinstance(direct, dict):
+        return direct
+
+    # Try fenced JSON block: ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", raw, re.IGNORECASE)
+    if fence_match:
+        fenced_candidate = _normalize_structured_metadata(fence_match.group(1))
+        if isinstance(fenced_candidate, dict):
+            return fenced_candidate
+
+    # Last-resort extraction between outermost braces.
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        sliced = _normalize_structured_metadata(raw[start : end + 1])
+        if isinstance(sliced, dict):
+            return sliced
+    return None
+
+
 def _metadata_is_usable(metadata: Optional[dict[str, Any]]) -> bool:
     payload = _normalize_structured_payload(metadata)
     if not isinstance(payload, dict) or not payload:
@@ -765,6 +791,27 @@ def _resolve_effective_model_meta(agent_id: str, trace_id: str) -> ModelMeta:
     )
 
 
+def _is_current_model_zhipu(agent_id: str) -> bool:
+    provider_id = ""
+    try:
+        agent_config = load_agent_config(agent_id)
+        active = agent_config.active_model
+        if active and active.provider_id:
+            provider_id = str(active.provider_id).strip()
+    except Exception:
+        logger.debug("读取agent模型配置失败（zhipu判断）", exc_info=True)
+
+    if not provider_id:
+        try:
+            global_model = ProviderManager.get_instance().get_active_model()
+            if global_model and global_model.provider_id:
+                provider_id = str(global_model.provider_id).strip()
+        except Exception:
+            logger.debug("读取全局模型配置失败（zhipu判断）", exc_info=True)
+
+    return provider_id.startswith("zhipu-")
+
+
 def _build_candidate_plan(
     output_raw: dict[str, Any],
     intents: list[SessionInferIntent],
@@ -953,28 +1000,40 @@ async def post_session_infer(
         structured_enabled = True
         non_stream_enforced = True
         structured_error_type = ""
+        zhipu_text_mode = _is_current_model_zhipu(target_agent_id)
+        structured_enabled = not zhipu_text_mode
         logger.info(
             "会话推理模型调用参数 trace_id=%s params=%s",
             trace_id,
             _json_for_log(
                 {
                     "messages": messages,
-                    "structured_model": SessionInferStructuredOutput.__name__,
+                    "structured_model": (
+                        None if zhipu_text_mode else SessionInferStructuredOutput.__name__
+                    ),
+                    "zhipu_text_mode": zhipu_text_mode,
                 }
             ),
         )
         try:
-            response = await model(
-                messages,
-                structured_model=SessionInferStructuredOutput,
-            )
-        except TypeError as exc:
-            non_stream_enforced = False
-            try:
+            if zhipu_text_mode:
+                # For Zhipu, prefer full text collection + local JSON parsing.
+                response = await model(messages)
+            else:
                 response = await model(
                     messages,
                     structured_model=SessionInferStructuredOutput,
                 )
+        except TypeError:
+            non_stream_enforced = False
+            try:
+                if zhipu_text_mode:
+                    response = await model(messages)
+                else:
+                    response = await model(
+                        messages,
+                        structured_model=SessionInferStructuredOutput,
+                    )
                 structured_error_type = ""
             except Exception as fallback_exc:
                 structured_enabled = False
@@ -1004,23 +1063,45 @@ async def post_session_infer(
 
         if response is None:
             raise ValueError(
-                f"Structured model call failed: {structured_error_type or 'unknown_error'}",
+                f"Model call failed: {structured_error_type or 'unknown_error'}",
             )
 
         collect_start = time.monotonic()
         if response is not None:
-            (
-                response_text,
-                response_metadata,
-                response_tool_candidate,
-                collect_error,
-                first_chunk_ms,
-                stream_chunk_count,
-                valid_metadata_at_chunk_idx,
-            ) = await _collect_model_output(
-                response,
-                stop_on_usable_metadata=False,
-            )
+            if zhipu_text_mode:
+                try:
+                    response_text = await _collect_model_text(response)
+                    response_metadata = None
+                    response_tool_candidate = None
+                    collect_error = None
+                    first_chunk_ms = 0 if response_text else None
+                    stream_chunk_count = 1 if response_text else 0
+                    valid_metadata_at_chunk_idx = None
+                except Exception as exc:
+                    response_text = ""
+                    response_metadata = None
+                    response_tool_candidate = None
+                    collect_error = f"{type(exc).__name__}: {exc}"
+                    first_chunk_ms = None
+                    stream_chunk_count = 0
+                    valid_metadata_at_chunk_idx = None
+                    logger.exception(
+                        "会话推理模型响应文本收集异常 trace_id=%s",
+                        trace_id,
+                    )
+            else:
+                (
+                    response_text,
+                    response_metadata,
+                    response_tool_candidate,
+                    collect_error,
+                    first_chunk_ms,
+                    stream_chunk_count,
+                    valid_metadata_at_chunk_idx,
+                ) = await _collect_model_output(
+                    response,
+                    stop_on_usable_metadata=False,
+                )
         else:
             (
                 response_text,
@@ -1050,6 +1131,11 @@ async def post_session_infer(
                 trace_id,
                 collect_error,
             )
+        if str(response_text or "").strip() == "```":
+            logger.warning(
+                "会话推理模型响应疑似截断 trace_id=%s response_text=```",
+                trace_id,
+            )
         parse_start = time.monotonic()
         metadata_keys: list[str] = (
             sorted(response_metadata.keys())
@@ -1071,6 +1157,9 @@ async def post_session_infer(
             source_candidates.append(("metadata", response_metadata))
         if tool_candidate_hit and response_tool_candidate is not None:
             source_candidates.append(("tool_candidate", response_tool_candidate))
+        text_payload = _extract_json_payload_from_text(response_text)
+        if isinstance(text_payload, dict):
+            source_candidates.append(("response_text", text_payload))
         if not source_candidates:
             raise ValueError(
                 "Missing usable structured payload from model output: "
