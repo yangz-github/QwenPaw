@@ -3,6 +3,7 @@
 
 Provides RESTful API for managing multiple agent instances.
 """
+
 import json
 import logging
 from pathlib import Path
@@ -19,6 +20,7 @@ from ..utils import schedule_agent_reload
 from ...config.config import (
     AgentProfileConfig,
     AgentProfileRef,
+    ModelSlotConfig,
     load_agent_config,
     save_agent_config,
     generate_short_agent_id,
@@ -27,7 +29,7 @@ from ...config.config import (
 )
 from ...config.utils import load_config, save_config
 from ...agents.memory.agent_md_manager import AgentMdManager
-from ...agents.utils import copy_workspace_md_files
+from ...agents.utils import copy_workspace_md_files, normalize_agent_language
 from ...agents.skills_manager import SkillPoolService, get_workspace_skills_dir
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
@@ -45,6 +47,7 @@ class AgentSummary(BaseModel):
     description: str
     workspace_dir: str
     enabled: bool
+    active_model: ModelSlotConfig | None = None
 
 
 class AgentListResponse(BaseModel):
@@ -71,8 +74,9 @@ class CreateAgentRequest(BaseModel):
     name: str
     description: str = ""
     workspace_dir: str | None = None
-    language: str = "en"
+    language: str | None = None
     skill_names: list[str] | None = None
+    active_model: ModelSlotConfig | None = None
 
     @field_validator("id", mode="before")
     @classmethod
@@ -192,6 +196,8 @@ async def list_agents() -> AgentListResponse:
                 else:
                     description = profile_desc
 
+            active_model = agent_config.active_model
+
             agents.append(
                 AgentSummary(
                     id=agent_id,
@@ -199,6 +205,7 @@ async def list_agents() -> AgentListResponse:
                     description=description,
                     workspace_dir=agent_ref.workspace_dir,
                     enabled=getattr(agent_ref, "enabled", True),
+                    active_model=active_model,
                 ),
             )
         except Exception:  # noqa: E722
@@ -322,16 +329,21 @@ async def create_agent(
         ToolsConfig,
     )
 
+    language = normalize_agent_language(
+        request.language or config.agents.language or "en",
+    )
+
     agent_config = AgentProfileConfig(
         id=new_id,
         name=request.name,
         description=request.description,
         workspace_dir=str(workspace_dir),
-        language=request.language,
+        language=language,
         channels=ChannelConfig(),
         mcp=MCPConfig(),
         heartbeat=HeartbeatConfig(),
         tools=ToolsConfig(),
+        active_model=request.active_model,
     )
 
     _initialize_agent_workspace(
@@ -339,6 +351,7 @@ async def create_agent(
         skill_names=(
             request.skill_names if request.skill_names is not None else []
         ),
+        language=language,
     )
 
     agent_ref = AgentProfileRef(
@@ -495,7 +508,10 @@ async def list_agent_files(
     except (ValueError, AppBaseException) as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
-    workspace_manager = AgentMdManager(str(workspace.workspace_dir))
+    workspace_manager = AgentMdManager(
+        str(workspace.workspace_dir),
+        agent_id=workspace.agent_id,
+    )
 
     try:
         files = [
@@ -526,7 +542,10 @@ async def read_agent_file(
     except (ValueError, AppBaseException) as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
-    workspace_manager = AgentMdManager(str(workspace.workspace_dir))
+    workspace_manager = AgentMdManager(
+        str(workspace.workspace_dir),
+        agent_id=workspace.agent_id,
+    )
 
     try:
         content = workspace_manager.read_working_md(filename)
@@ -560,7 +579,10 @@ async def write_agent_file(
     except (ValueError, AppBaseException) as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
-    workspace_manager = AgentMdManager(str(workspace.workspace_dir))
+    workspace_manager = AgentMdManager(
+        str(workspace.workspace_dir),
+        agent_id=workspace.agent_id,
+    )
 
     try:
         workspace_manager.write_working_md(filename, file_content.content)
@@ -587,7 +609,10 @@ async def list_agent_memory(
     except (ValueError, AppBaseException) as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
-    workspace_manager = AgentMdManager(str(workspace.workspace_dir))
+    workspace_manager = AgentMdManager(
+        str(workspace.workspace_dir),
+        agent_id=workspace.agent_id,
+    )
 
     try:
         files = [
@@ -684,6 +709,7 @@ def _initialize_agent_workspace(
     workspace_dir: Path,
     skill_names: list[str] | None = None,
     md_template_id: str | None = None,
+    language: str | None = None,
 ) -> None:
     """Initialize agent workspace with only explicitly requested skills."""
     from ...config import load_config as load_global_config
@@ -693,7 +719,8 @@ def _initialize_agent_workspace(
     get_workspace_skills_dir(workspace_dir).mkdir(exist_ok=True)
 
     config = load_global_config()
-    language = config.agents.language or "zh"
+    if not language:
+        language = config.agents.language or "zh"
 
     _apply_workspace_md_templates(
         workspace_dir,

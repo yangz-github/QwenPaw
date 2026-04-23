@@ -20,7 +20,7 @@ class AgentContextMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        """Extract agentId from path/header and inject into context."""
+        """Extract agentId and root_session_id from path/headers."""
         import logging
         from ..agent_context import set_current_agent_id
 
@@ -46,6 +46,19 @@ class AgentContextMiddleware(BaseHTTPMiddleware):
         if agent_id:
             set_current_agent_id(agent_id)
 
+        # Extract X-Root-Session-Id header for cross-session approval routing
+        root_session_id = request.headers.get("X-Root-Session-Id")
+        if root_session_id:
+            # Inject into request.request_context for runner access
+            if not hasattr(request, "request_context"):
+                request.request_context = {}
+            request.request_context["root_session_id"] = root_session_id
+            logger.debug(
+                "AgentContextMiddleware: root_session_id=%s from "
+                "X-Root-Session-Id header",
+                root_session_id[:12],
+            )
+
         response = await call_next(request)
         return response
 
@@ -66,6 +79,7 @@ def create_agent_scoped_router() -> APIRouter:
     from ..runner.api import router as chats_router
     from .console import router as console_router
     from .plugins import router as plugins_router
+    from .plan import router as plan_router
 
     # Create parent router with agentId parameter
     router = APIRouter(prefix="/agents/{agentId}", tags=["agent-scoped"])
@@ -89,5 +103,6 @@ def create_agent_scoped_router() -> APIRouter:
     router.include_router(workspace_router)
     router.include_router(console_router)
     router.include_router(plugins_router)
+    router.include_router(plan_router)
 
     return router
