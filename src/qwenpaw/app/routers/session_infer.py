@@ -25,6 +25,8 @@ PROMPT_VERSION = "qwenpaw-session-infer-v2"
 SESSION_INFER_PROMPT_MAX_DESCRIPTION_CHARS = 160
 SESSION_INFER_LOG_MAX_TEXT_CHARS = 200
 SESSION_INFER_LOG_MAX_LIST_ITEMS = 5
+DEFAULT_SESSION_INFER_PROVIDER_ID = "zhipu-cn"
+DEFAULT_SESSION_INFER_MODEL = "glm-4-flash-250414"
 
 router = APIRouter(prefix="/qwenpaw", tags=["qwenpaw"])
 
@@ -54,6 +56,8 @@ class SessionInferRequest(BaseModel):
     conversationId: Optional[str] = None
     chatId: Optional[str] = None
     agentId: Optional[str] = None
+    providerId: Optional[str] = Field(default=DEFAULT_SESSION_INFER_PROVIDER_ID)
+    model: Optional[str] = Field(default=DEFAULT_SESSION_INFER_MODEL)
 
 
 class CandidatePlan(BaseModel):
@@ -764,23 +768,34 @@ def _enforce_slot_completion(
     return repaired, changed, filled_count, missing_required
 
 
-def _resolve_effective_model_meta(agent_id: str, trace_id: str) -> ModelMeta:
+def _resolve_effective_model_meta(
+    agent_id: str,
+    trace_id: str,
+    provider_id_override: Optional[str] = None,
+    model_override: Optional[str] = None,
+) -> ModelMeta:
     manager = ProviderManager.get_instance()
     provider_id = "unknown"
     model_name = "unknown"
-    try:
-        agent_config = load_agent_config(agent_id)
-        active = agent_config.active_model
-        if active and active.provider_id and active.model:
-            provider_id = active.provider_id
-            model_name = active.model
-        else:
-            global_model = manager.get_active_model()
-            if global_model and global_model.provider_id and global_model.model:
-                provider_id = global_model.provider_id
-                model_name = global_model.model
-    except Exception:
-        logger.debug("解析生效模型元信息失败", exc_info=True)
+    override_provider = str(provider_id_override or "").strip()
+    override_model = str(model_override or "").strip()
+    if override_provider and override_model:
+        provider_id = override_provider
+        model_name = override_model
+    else:
+        try:
+            agent_config = load_agent_config(agent_id)
+            active = agent_config.active_model
+            if active and active.provider_id and active.model:
+                provider_id = active.provider_id
+                model_name = active.model
+            else:
+                global_model = manager.get_active_model()
+                if global_model and global_model.provider_id and global_model.model:
+                    provider_id = global_model.provider_id
+                    model_name = global_model.model
+        except Exception:
+            logger.debug("解析生效模型元信息失败", exc_info=True)
 
     request_id = trace_id.strip() or f"qwenpaw-{uuid4().hex[:12]}"
     return ModelMeta(
@@ -791,13 +806,20 @@ def _resolve_effective_model_meta(agent_id: str, trace_id: str) -> ModelMeta:
     )
 
 
-def _is_current_model_zhipu(agent_id: str) -> bool:
+def _is_current_model_zhipu(
+    agent_id: str,
+    provider_id_override: Optional[str] = None,
+) -> bool:
     provider_id = ""
+    override_provider = str(provider_id_override or "").strip()
+    if override_provider:
+        provider_id = override_provider
     try:
-        agent_config = load_agent_config(agent_id)
-        active = agent_config.active_model
-        if active and active.provider_id:
-            provider_id = str(active.provider_id).strip()
+        if not provider_id:
+            agent_config = load_agent_config(agent_id)
+            active = agent_config.active_model
+            if active and active.provider_id:
+                provider_id = str(active.provider_id).strip()
     except Exception:
         logger.debug("读取agent模型配置失败（zhipu判断）", exc_info=True)
 
@@ -810,6 +832,22 @@ def _is_current_model_zhipu(agent_id: str) -> bool:
             logger.debug("读取全局模型配置失败（zhipu判断）", exc_info=True)
 
     return provider_id.startswith("zhipu-")
+
+
+def _resolve_model_override(
+    payload: SessionInferRequest,
+) -> tuple[Optional[str], Optional[str]]:
+    provider_id = str(payload.providerId or "").strip()
+    model_id = str(payload.model or "").strip()
+    if not provider_id and not model_id:
+        return DEFAULT_SESSION_INFER_PROVIDER_ID, DEFAULT_SESSION_INFER_MODEL
+    if bool(provider_id) != bool(model_id):
+        raise ValueError(
+            "providerId and model must be provided together",
+        )
+    if provider_id and model_id:
+        return provider_id, model_id
+    return None, None
 
 
 def _build_candidate_plan(
@@ -971,13 +1009,32 @@ async def post_session_infer(
         set_current_agent_id(target_agent_id)
         if payload.sessionId:
             set_current_session_id(payload.sessionId.strip())
+        override_provider_id, override_model_id = _resolve_model_override(
+            payload,
+        )
+        if override_provider_id and override_model_id:
+            logger.info(
+                "会话推理模型覆盖 trace_id=%s provider_id=%s model=%s",
+                trace_id,
+                override_provider_id,
+                override_model_id,
+            )
 
         if not payload.intents:
             logger.warning("会话推理请求缺少intents trace_id=%s", trace_id)
             return SessionInferResponse(code=1, message="No intents provided")
 
         model_create_start = time.monotonic()
-        model, _ = create_model_and_formatter(agent_id=target_agent_id)
+        if override_provider_id and override_model_id:
+            manager = ProviderManager.get_instance()
+            provider = manager.get_provider(override_provider_id)
+            if provider is None:
+                raise ValueError(
+                    f"Provider '{override_provider_id}' not found",
+                )
+            model = provider.get_chat_model_instance(override_model_id)
+        else:
+            model, _ = create_model_and_formatter(agent_id=target_agent_id)
         model_create_ms = int((time.monotonic() - model_create_start) * 1000)
         logger.info(
             "会话推理阶段=创建模型 trace_id=%s model_create_ms=%d",
@@ -1000,7 +1057,10 @@ async def post_session_infer(
         structured_enabled = True
         non_stream_enforced = True
         structured_error_type = ""
-        zhipu_text_mode = _is_current_model_zhipu(target_agent_id)
+        zhipu_text_mode = _is_current_model_zhipu(
+            target_agent_id,
+            provider_id_override=override_provider_id,
+        )
         structured_enabled = not zhipu_text_mode
         logger.info(
             "会话推理模型调用参数 trace_id=%s params=%s",
@@ -1012,6 +1072,14 @@ async def post_session_infer(
                         None if zhipu_text_mode else SessionInferStructuredOutput.__name__
                     ),
                     "zhipu_text_mode": zhipu_text_mode,
+                    "model_override": (
+                        {
+                            "providerId": override_provider_id,
+                            "model": override_model_id,
+                        }
+                        if (override_provider_id and override_model_id)
+                        else None
+                    ),
                 }
             ),
         )
@@ -1241,6 +1309,8 @@ async def post_session_infer(
         model_meta = _resolve_effective_model_meta(
             target_agent_id,
             payload.traceId,
+            provider_id_override=override_provider_id,
+            model_override=override_model_id,
         )
         logger.info(
             "会话推理阶段=解析模型元信息 trace_id=%s model_meta=%s",
