@@ -37,17 +37,18 @@
 
 主流程（当前版本）：
 
-1. 记录请求日志（直接打印 `payload.model_dump()`）
+1. 记录请求日志（`_json_for_log(payload.model_dump())`）
 2. 解析目标 agent 并绑定上下文
-3. 校验 `intents` 非空
-4. 创建模型实例
-5. 构造 prompt（system + user）
-6. 调用结构化模型输出
-7. 收集模型输出（流式/非流式）
-8. 从 `metadata/tool_candidate` 解析 source candidates
-9. 构建 `candidatePlan`（强校验）
-10. 槽位补全与澄清判定
-11. 组装 `modelMeta` 并返回
+3. 解析并校验 `providerId/model` 覆盖参数
+4. 校验 `intents` 非空
+5. 创建模型实例
+6. 构造 prompt（system + user）
+7. 按 provider 选择调用模式（Zhipu 文本模式 / 结构化模式）
+8. 收集模型输出（流式/非流式，或文本）
+9. 从 `metadata/tool_candidate/response_text` 解析 source candidates
+10. 构建 `candidatePlan`（强校验）
+11. 槽位补全与澄清判定
+12. 组装 `modelMeta` 并返回
 
 ---
 
@@ -62,6 +63,7 @@
   - `routingPolicy`
   - `outputSchema`
   - `sessionId/conversationId/chatId/agentId`
+  - `providerId/model`（可选，必须成对出现；都不传时使用默认覆盖：`zhipu-cn` + `glm-4-flash-250414`）
 
 ### 4.2 响应模型
 
@@ -107,15 +109,21 @@
 
 ### 6.1 模型调用
 
-调用方式：
+调用分支：
 
-- `model(messages, structured_model=SessionInferStructuredOutput)`
+1. 非 Zhipu：
+   - `model(messages, structured_model=SessionInferStructuredOutput)`
+2. Zhipu：
+   - `model(messages)`（文本模式）
 
-失败时记录 `structured_error_type` 并走异常分支。
+失败时记录 `structured_error_type` 并走异常分支；调用参数会记录到 `会话推理模型调用参数` 日志。
 
 ### 6.2 输出收集
 
-函数：`_collect_model_output(response, stop_on_usable_metadata=True)`
+函数：
+
+- `_collect_model_output(response, stop_on_usable_metadata=False)`（结构化模式）
+- `_collect_model_text(response)`（Zhipu 文本模式）
 
 收集内容：
 
@@ -129,7 +137,8 @@
 当前行为：
 
 - 支持流式与非流式
-- `stop_on_usable_metadata=True` 时，拿到可用 metadata 可提前退出流读取
+- 即使 `stop_on_usable_metadata=True`，当前实现也只记录 `valid_metadata_at_chunk_idx`，不会提前中断读取
+- Zhipu 文本模式仅收集文本，再走本地 JSON 提取
 - **不再有 collect 超时预算截断逻辑**
 
 ---
@@ -177,6 +186,7 @@
 
 1. `metadata`
 2. `tool_candidate`
+3. `response_text`（从文本提取 JSON：支持直接 JSON、fenced JSON、外层 `{...}` 截取）
 
 若都失败，返回 `code=1`，并在错误信息中包含逐源失败原因。
 
@@ -276,13 +286,14 @@
 
 ## 9. ModelMeta 解析逻辑
 
-函数：`_resolve_effective_model_meta(agent_id, trace_id)`
+函数：`_resolve_effective_model_meta(agent_id, trace_id, provider_id_override, model_override)`
 
 来源顺序：
 
-1. agent `active_model`
-2. 全局 active model
-3. fallback：`provider/model = "unknown"`
+1. 请求覆盖参数 `providerId/model`（当两者都提供时）
+2. agent `active_model`
+3. 全局 active model
+4. fallback：`provider/model = "unknown"`
 
 `requestId`：
 
@@ -323,23 +334,24 @@
 ### 11.2 关键日志点
 
 - 请求入口：
-  - `会话推理请求载荷 payload=%s`（直接 `payload.model_dump()`）
+  - `会话推理请求载荷 payload=%s`（`_json_for_log(payload.model_dump())`）
 - 阶段耗时：
   - `会话推理阶段=解析agent`
   - `会话推理阶段=创建模型`
   - `会话推理阶段=构建提示词`
   - `会话推理阶段=模型调用`
-  - `会话推理阶段=收集输出`
   - `会话推理阶段=解析载荷`
   - `会话推理阶段=candidate处理`
   - `会话推理阶段=解析模型元信息`
   - `会话推理耗时汇总`（总览）
 - 数据调试：
-  - `会话推理收集结果-metadata`
-  - `会话推理收集结果-tool_candidate`
+  - `会话推理模型调用参数`
+  - `会话推理模型响应完整快照`（含 `response_text/response_metadata/response_tool_candidate/collect_error`）
   - `candidate_before/candidate_after`
 - 常见告警/错误：
   - `会话推理metadata不完整`
+  - `会话推理模型响应收集异常`
+  - `会话推理模型响应疑似截断`
   - `会话推理candidate解析失败`
   - `会话推理失败`
 
@@ -351,16 +363,20 @@
 flowchart TD
     A[收到 /session/infer 请求] --> B[记录 request payload 日志]
     B --> C[解析 target_agent_id 并设置上下文]
-    C --> D{intents 是否为空}
+    C --> C1[解析 providerId/model 覆盖参数]
+    C1 --> D{intents 是否为空}
     D -->|是| D1[返回 code=1 No intents provided]
     D -->|否| E[创建模型实例]
     E --> F[构建 system/user prompt]
-    F --> G[调用模型 structured_output]
-    G --> H{模型调用成功?}
+    F --> G{是否 zhipu_text_mode}
+    G -->|是| G1[model(messages) 文本模式]
+    G -->|否| G2[model(..., structured_model=...)]
+    G1 --> H{模型调用成功?}
+    G2 --> H{模型调用成功?}
     H -->|否| H1[抛错并返回 code=1]
     H -->|是| I[收集 text/metadata/tool_candidate]
     I --> J[标准化结构化 payload structuredOutput/candidatePlan]
-    J --> K[依次尝试 metadata -> tool_candidate 构建 candidate]
+    J --> K[依次尝试 metadata -> tool_candidate -> response_text 构建 candidate]
     K --> L{candidate 构建成功?}
     L -->|否| L1[返回 code=1 + 逐源失败原因]
     L -->|是| M[槽位补全与澄清判定]
@@ -381,11 +397,12 @@ sequenceDiagram
 
     Client->>API: POST /qwenpaw/session/infer
     API->>API: 记录请求payload日志
-    API->>Model: model(messages, structured_model=...)
+    API->>API: 判断 zhipu_text_mode
+    API->>Model: model(messages) 或 model(messages, structured_model=...)
     Model-->>API: response(stream/non-stream)
-    API->>API: 收集输出(metadata/tool_candidate)
+    API->>API: 收集输出(response_text/metadata/tool_candidate)
     API->>Parser: 标准化结构化payload
-    API->>Parser: 构建candidatePlan(先metadata后tool_candidate)
+    API->>Parser: 构建candidatePlan(先metadata后tool_candidate再response_text)
     Parser-->>API: CandidatePlan(校验后)
     API->>Parser: 执行槽位补全
     Parser-->>API: CandidatePlan(补槽/clarify)
