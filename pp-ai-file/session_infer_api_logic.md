@@ -238,7 +238,7 @@
     - `product`: `["产品", "product"]`
     - `client_id`: `["clientId", "客户ID", "client_id"]`
   - `slotSchema.properties.product.x-enum-aliases`:
-    - `稳额`: `["稳额产品"]`
+    - `LY-DP`: `["稳额","稳额产品"]`
 
 模型初始输出（candidate）：
 
@@ -274,7 +274,7 @@
   "executionMode": "SQL_TEMPLATE",
   "confidence": 0.6,
   "slots": {
-    "product": "稳额",
+    "product": "LY-DP",
     "client_id": "1006"
   },
   "needClarify": false,
