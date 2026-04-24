@@ -361,27 +361,27 @@
 
 ```mermaid
 flowchart TD
-    A[收到 /session/infer 请求] --> B[记录 request payload 日志]
-    B --> C[解析 target_agent_id 并设置上下文]
-    C --> C1[解析 providerId/model 覆盖参数]
+    A[收到 session infer 请求] --> B[记录请求日志]
+    B --> C[解析目标 agent 并设置上下文]
+    C --> C1[解析 providerId 与 model 覆盖参数]
     C1 --> D{intents 是否为空}
     D -->|是| D1[返回 code=1 No intents provided]
     D -->|否| E[创建模型实例]
-    E --> F[构建 system/user prompt]
+    E --> F[构建 system 与 user prompt]
     F --> G{是否 zhipu_text_mode}
-    G -->|是| G1[model(messages) 文本模式]
-    G -->|否| G2[model(..., structured_model=...)]
-    G1 --> H{模型调用成功?}
-    G2 --> H{模型调用成功?}
-    H -->|否| H1[抛错并返回 code=1]
-    H -->|是| I[收集 text/metadata/tool_candidate]
-    I --> J[标准化结构化 payload structuredOutput/candidatePlan]
-    J --> K[依次尝试 metadata -> tool_candidate -> response_text 构建 candidate]
-    K --> L{candidate 构建成功?}
-    L -->|否| L1[返回 code=1 + 逐源失败原因]
-    L -->|是| M[槽位补全与澄清判定]
+    G -->|是| G1[文本模式调用 model messages]
+    G -->|否| G2[结构化模式调用 model structured output]
+    G1 --> H{模型调用是否成功}
+    G2 --> H
+    H -->|否| H1[返回 code=1 Model call failed]
+    H -->|是| I[收集响应 text metadata tool candidate]
+    I --> J[标准化结构化 payload]
+    J --> K[按顺序尝试 metadata tool_candidate response_text 构建 candidate]
+    K --> L{candidate 是否构建成功}
+    L -->|否| L1[返回 code=1 并附逐源失败原因]
+    L -->|是| M[执行槽位补全与澄清判定]
     M --> N[解析 modelMeta]
-    N --> O[返回 code=0 + candidatePlan + modelMeta]
+    N --> O[返回 code=0 和 candidatePlan modelMeta]
 ```
 
 ---
