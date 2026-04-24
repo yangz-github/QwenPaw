@@ -20,25 +20,25 @@ read_when:
 
 ## 渠道与技能边界
 
-当前场景为钉钉问答，查询统一走 `copaw_orchestrator`。
+当前场景为钉钉问答，查询统一走 `pp_question_answering`。
 
 严格规则：
 
-1. 单轮用户问题，最多调用一次 `copaw_orchestrator`。
+1. 单轮用户问题，最多调用一次 `pp_question_answering`。
 2. 禁止在同一轮内“自动改写用户问题后再次调用”。
-3. 只要是用户新发的一轮业务问答消息（包括对澄清的回复、改问另一个问题、改问另一个模板），默认都要先调用一次 `copaw_orchestrator`。
-4. “新问题”还是“澄清续问”由 `copaw_orchestrator` 内部判断，agent 不得在调用前自行拦截。
+3. 只要是用户新发的一轮业务问答消息（包括对澄清的回复、改问另一个问题、改问另一个模板），默认都要先调用一次 `pp_question_answering`。
+4. “新问题”还是“澄清续问”由 `pp_question_answering` 内部判断，agent 不得在调用前自行拦截。
 5. 若上一轮存在 `clarify_resume.resume_context`，本轮调用时应一并透传给 skill，由 skill 决定是否继续原 trace。
-6. 若 `copaw_orchestrator` 返回状态为非 `CLARIFY_REQUIRED`，必须直接答复并停止，不得继续自动重试。
+6. 若 `pp_question_answering` 返回状态为非 `CLARIFY_REQUIRED`，必须直接答复并停止，不得继续自动重试。
 7. 只有当返回 `CLARIFY_REQUIRED` 时，才向用户发起澄清问题；澄清问题应优先使用 skill 返回内容，不得擅自改写业务口径。
 8. 不得私自构造“新的用户问题”发起查询。
 9. 不得将用户未明确要求的查询范围自动扩展（例如：用户只问“中小客户”，禁止再补查 LY-DP/其他产品）。
 
 ## 调用前硬门禁（每次调用查询前必须自检）
 
-在发起 `copaw_orchestrator` 之前，必须逐条检查；任一不满足即禁止调用：
+在发起 `pp_question_answering` 之前，必须逐条检查；任一不满足即禁止调用：
 
-1. 本轮是否已经调用过一次 `copaw_orchestrator`？若是，禁止再次调用。
+1. 本轮是否已经调用过一次 `pp_question_answering`？若是，禁止再次调用。
 2. 本次调用问题文本是否保持用户原话语义（允许只做必要的 JSON 转义），若被改写为新问题，禁止调用。
 3. 是否在替用户做主扩展维度（产品、时间、人群、渠道）？若是，禁止调用。
 4. 若存在上一轮 `clarify_resume.resume_context`，是否已准备透传给 skill？未透传则禁止调用。
@@ -47,7 +47,7 @@ read_when:
 
 当上一轮返回 `CLARIFY_REQUIRED` 后，用户在下一轮无论是补充澄清还是改问新问题，都必须调用一次 skill：
 
-1. 仅在新一轮中调用一次 `copaw_orchestrator`。
+1. 仅在新一轮中调用一次 `pp_question_answering`。
 2. 本轮调用必须携带：
    - 当前用户消息原文（`question`）
    - 若有则携带上一轮 `resume_context`（由 skill 决定采用或忽略）
@@ -57,7 +57,7 @@ read_when:
 ## 标准工作流
 
 1. 识别用户原始问题与关键实体（如 clientId、产品、时间范围）。
-2. 先调用一次 `copaw_orchestrator`（如有 `resume_context` 一并透传），由 skill 判断是新问题还是澄清续问。
+2. 先调用一次 `pp_question_answering`（如有 `resume_context` 一并透传），由 skill 判断是新问题还是澄清续问。
 3. 根据返回结果生成答复：
    - `CLARIFY_REQUIRED`：仅输出澄清问题清单，优先使用 skill 返回的澄清问题。
    - 非 `CLARIFY_REQUIRED`：输出结论、依据、必要风险提示，结束本轮。
@@ -90,7 +90,7 @@ read_when:
 
 ## 实时数据强约束（必遵守）
 
-1. 最终业务结论只允许基于“本轮 copaw_orchestrator 返回的 result”。
+1. 最终业务结论只允许基于“本轮 pp_question_answering 返回的 result”。
 2. 禁止使用历史查询结果、记忆摘要、上一轮结果作为本轮结论依据。
 3. 若本轮返回 MODEL_TIMEOUT / ERROR / SKIPPED / result为空：
    - 必须明确回复“本轮未获得实时结果”
